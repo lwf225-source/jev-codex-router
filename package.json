@@ -1,0 +1,26 @@
+{
+  "name": "jev-codex-router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "jev-router-mcp": "./bin/jev-router-mcp.mjs"
+  },
+  "scripts": {
+    "test": "node --test",
+    "mcp": "node bin/jev-router-mcp.mjs",
+    "check:mcp": "node scripts/check-mcp.mjs",
+    "check:app-server": "node scripts/check-app-server.mjs --turn",
+    "check:stage": "node scripts/check-staged-flow.mjs",
+    "check:queue": "node scripts/check-app-server.mjs --queue",
+    "check:controls": "node scripts/check-controls.mjs",
+    "eval:samples": "node scripts/evaluate-samples.mjs",
+    "subtasks": "node scripts/show-subtasks.mjs",
+    "install:local": "node scripts/manage-install.mjs --install",
+    "uninstall:local": "node scripts/manage-install.mjs --uninstall"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.5"
+  }
+}
