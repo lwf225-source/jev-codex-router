@@ -462,3 +462,169 @@ test(
     assert.equal(saved.pending, undefined);
   }),
 );
+
+// Real native entry envelopes, bounded pagination, and a persisted metadata plan.
+import { inspectSubtasks } from '../src/subtask-history.mjs';
+import { executionHistoryScope, readExecutionPlan } from '../src/execution-plan.mjs';
+const registrationEntry = (plan, changes = {}) => ({
+  turnId: 'parent-turn', startedAtMs: Date.parse(plan.createdAt) - 1,
+  completedAtMs: Date.parse(plan.createdAt) + 1,
+  item: {
+    type: 'mcpToolCall', server: 'jev-router', tool: 'register_execution_plan',
+    status: 'completed', arguments: { threadId: 'parent' }, error: null,
+    result: { content: [{ type: 'text', text: JSON.stringify(plan) }] },
+  }, ...changes,
+});
+const activityEntry = (token, id = 'child') => ({ item: {
+  type: 'subAgentActivity', agentThreadId: id, agentPath: `/root/${token}`, kind: 'completed',
+} });
+const routeEntry = (d) => ({ item: {
+  type: 'mcpToolCall', server: 'jev-router', tool: 'route_execution_subtask',
+  status: 'completed', result: { structuredContent: d },
+} });
+const ancient = () => Array.from({ length: 700 }, (_, i) => ({ item: {
+  type: 'subAgentActivity', agentThreadId: `ancient-${i}`, agentPath: `/root/ancient-${i}`, kind: 'completed',
+} }));
+function nativeReaders(entries, { childModel = 'gpt-6-sol', childHistoryIncomplete = false, badCursor = false } = {}) {
+  const calls = [];
+  return {
+    calls,
+    readThread: async ({ threadId }) => ({ thread: {
+      id: threadId, historyMode: 'paginated', parentThreadId: threadId === 'parent' ? null : 'parent',
+      model: childModel, reasoningEffort: 'medium', turns: [], status: { type: 'idle' },
+    } }),
+    readItems: async ({ threadId, cursor, limit }) => {
+      calls.push({ threadId, cursor, limit });
+      if (threadId !== 'parent') return { data: [], nextCursor: childHistoryIncomplete ? String(Number(cursor || 0) + 1) : null };
+      const offset = Number(cursor || 0);
+      return { data: entries.slice(offset, offset + limit), ...(badCursor ? {} : {
+        nextCursor: offset + limit < entries.length ? String(offset + limit) : null,
+      }) };
+    },
+  };
+}
+async function scopedHistory(plan, entries, opts = {}) {
+  const io = nativeReaders(entries, opts);
+  const h = await inspectSubtasks({ threadId: 'parent', registrationScope: executionHistoryScope(plan),
+    ...io, ...(opts.inspect || {}) });
+  return { h, io };
+}
+async function acceptedFixture(options) {
+  const plan = await registerExecutionPlan({ threadId: 'parent', units: [unit] }, options);
+  const d = await routePlannedUnit(args, decide, options);
+  await reconcileExecutionPlan('parent', report(d), options);
+  await recordExecutionAcceptance({ ...args, routeId: d.routeId, accepted: true, evidence: 'Private native deliverable checked' }, options);
+  return { plan: await readExecutionPlan('parent', options), d, original: plan };
+}
+
+test('original native registration proves a complete current plan despite 700 older unrelated items', temporary(async (options) => {
+  const { plan, d, original } = await acceptedFixture(options);
+  const entries = [activityEntry(d.routingToken), routeEntry(d), registrationEntry(original), ...ancient()];
+  const { h, io } = await scopedHistory(plan, entries);
+  assert.equal(h.truncated, true);
+  assert.equal(h.coverage.globalHistory, 'truncated');
+  assert.equal(h.coverage.parentHistory, 'unknown');
+  assert.equal(h.coverage.currentPlan.coverage, 'complete');
+  assert.equal(h.coverage.candidateCount, 1);
+  assert.equal(h.coverage.parentItemLimit, 500);
+  assert.equal(io.calls.filter((x) => x.threadId === 'parent').length, 1);
+  const result = await reconcileExecutionPlan('parent', h, options);
+  assert.equal(result.allVerified, true);
+  assert.equal(result.coverageScope, 'currentPlan');
+  const persisted = await readFile(join(options.dataDir, 'execution-plans.json'), 'utf8');
+  for (const secret of [unit.task, unit.acceptanceCriteria, 'Private native deliverable checked']) assert.equal(persisted.includes(secret), false);
+}));
+
+test('missing or mismatched registration proof and idempotent replay cannot shorten the plan interval', temporary(async (options) => {
+  const { plan, d, original } = await acceptedFixture(options);
+  const created = Date.parse(plan.createdAt);
+  const valid = registrationEntry(original);
+  const invalid = [
+    null,
+    { ...valid, startedAtMs: undefined },
+    { ...valid, completedAtMs: null },
+    { ...valid, startedAtMs: created + 2, completedAtMs: created + 3 },
+    { ...valid, item: { ...valid.item, arguments: { threadId: 'another-parent' } } },
+    { ...valid, item: { ...valid.item, server: 'another-server' } },
+    { ...valid, item: { ...valid.item, status: 'failed' } },
+    { ...valid, item: { ...valid.item, result: { structuredContent: { planId: 'wrong-plan' } } } },
+  ];
+  for (const boundary of invalid) {
+    const entries = [activityEntry(d.routingToken), routeEntry(d), ...(boundary ? [boundary] : []), ...ancient()];
+    const { h } = await scopedHistory(plan, entries);
+    assert.equal(h.coverage.currentPlan.coverage, 'incomplete');
+    assert.equal((await reconcileExecutionPlan('parent', h, options)).allVerified, false);
+    assert.ok(h.coverage.parentItemsRead <= 500);
+  }
+  const reused = registrationEntry(original, { startedAtMs: created + 20, completedAtMs: created + 30 });
+  const padding = Array.from({ length: 105 }, () => ({ item: { type: 'userMessage' } }));
+  const { h } = await scopedHistory(plan, [reused, ...padding, activityEntry(d.routingToken), routeEntry(d), valid, ...ancient()]);
+  assert.equal(h.coverage.parentPagesRead, 2);
+  assert.equal(h.coverage.currentPlan.boundary.startedAtMs, created - 1);
+  assert.equal((await reconcileExecutionPlan('parent', h, options)).allVerified, true);
+}));
+
+test('current-plan events exceeding 500 items, pagination errors and unread children never verify', temporary(async (options) => {
+  const { plan, d, original } = await acceptedFixture(options);
+  const entries = [activityEntry(d.routingToken), routeEntry(d), registrationEntry(original), ...ancient()];
+  for (const [input, opts] of [
+    [[...Array.from({ length: 500 }, () => ({ item: { type: 'userMessage' } })), ...entries], {}],
+    [entries, { badCursor: true }],
+    [entries, { childHistoryIncomplete: true, inspect: { includeResults: true } }],
+    [[activityEntry('jev_' + 'b'.repeat(32), 'another'), ...entries], { inspect: { limit: 1 } }],
+    [[activityEntry(d.routingToken, 'duplicate'), ...entries], {}],
+    [entries, { childModel: 'gpt-6-luna' }],
+    [[activityEntry(d.routingToken), routeEntry({ ...d, model: 'gpt-6-astra' }), registrationEntry(original), ...ancient()], {}],
+  ]) {
+    const { h } = await scopedHistory(plan, input, opts);
+    assert.equal((await reconcileExecutionPlan('parent', h, options)).allVerified, false);
+    assert.ok(h.coverage.parentItemsRead <= 500);
+  }
+}));
+
+test('replacement retains original registration target and cannot scope inherited attempts to replacement time', temporary(async (options) => {
+  const { plan, d, original } = await acceptedFixture(options);
+  const added = { ...unit, unitId: 'added' };
+  const replacement = await registerExecutionPlan({ threadId: 'parent', units: [unit, added], replace: true }, options);
+  assert.deepEqual(replacement.historyOrigin, { planId: plan.planId, createdAt: plan.createdAt });
+  const newD = await routePlannedUnit({ ...args, unitId: 'added' }, decide, options);
+  await reconcileExecutionPlan('parent', { coverage: { parentHistory: 'complete' }, tasks: [...report(d).tasks, ...report(newD).tasks] }, options);
+  await recordExecutionAcceptance({ ...args, unitId: 'added', routeId: newD.routeId, accepted: true, evidence: 'checked' }, options);
+  const current = await readExecutionPlan('parent', options);
+  const recent = [activityEntry(newD.routingToken, 'new-child'), routeEntry(newD), registrationEntry(replacement)];
+  let h = (await scopedHistory(current, [...recent, ...ancient()])).h;
+  assert.equal(h.coverage.currentPlan.coverage, 'incomplete');
+  assert.equal((await reconcileExecutionPlan('parent', h, options)).allVerified, false);
+  h = (await scopedHistory(current, [...recent, activityEntry(d.routingToken), routeEntry(d), registrationEntry(original), ...ancient()])).h;
+  assert.equal((await reconcileExecutionPlan('parent', h, options)).allVerified, true);
+  const { writeFile } = await import('node:fs/promises');
+  // Legacy replacement has no provenance and carries an attempt predating its registration.
+  delete current.historyOrigin;
+  current.createdAt = new Date(Date.parse(d.createdAt || original.createdAt) + 1000).toISOString();
+  await writeFile(join(options.dataDir, 'execution-plans.json'), JSON.stringify([current]));
+  assert.equal(executionHistoryScope(current).originPlanId, undefined);
+  h = (await scopedHistory(current, [...recent, activityEntry(d.routingToken), registrationEntry(current), ...ancient()])).h;
+  assert.equal((await reconcileExecutionPlan('parent', h, options)).allVerified, false);
+}));
+
+test('a registration found on a broken pagination page cannot bypass the read error', temporary(async (options) => {
+  const { plan, d, original } = await acceptedFixture(options);
+  let page = 0;
+  const io = nativeReaders([]);
+  io.readItems = async () => ({ data: ++page === 1
+    ? [activityEntry(d.routingToken), routeEntry(d)] : [registrationEntry(original)], nextCursor: 'repeat' });
+  const h = await inspectSubtasks({ threadId: 'parent', registrationScope: executionHistoryScope(plan), ...io });
+  assert.match(h.readError, /repeated a cursor/);
+  assert.equal(h.coverage.currentPlan.coverage, 'incomplete');
+  assert.equal((await reconcileExecutionPlan('parent', h, options)).allVerified, false);
+}));
+
+test('unlinked route evidence and mismatched scoped plan proof cannot verify', temporary(async (options) => {
+  const { plan, d, original } = await acceptedFixture(options);
+  const { h } = await scopedHistory(plan, [activityEntry(d.routingToken), routeEntry(d), registrationEntry(original), ...ancient()]);
+  for (const changed of [
+    { ...h, coverage: { ...h.coverage, unlinkedRoutingTokens: ['jev_' + 'c'.repeat(32)] } },
+    { ...h, coverage: { ...h.coverage, currentPlan: { ...h.coverage.currentPlan, planId: 'other-plan' } } },
+    { ...h, tasks: [...h.tasks, { childThreadId: 'unread', readError: 'unavailable' }] },
+  ]) assert.equal((await reconcileExecutionPlan('parent', changed, options)).allVerified, false);
+}));

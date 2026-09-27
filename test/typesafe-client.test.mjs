@@ -127,3 +127,14 @@ test("Choice category contract is validated and low confidence is unknown", asyn
   const result = await run({ ...validAnswers.task_kind, confidence: 0.2 });
   assert.equal(result.taskKind, "unknown");
 });
+
+
+test("judgment instructions distinguish report scope from historical implementation", async () => {
+  let body;
+  await evaluateTask({ prompt: "What is the status?", context: { turnIntent: "status", historyTruncated: true }, apiKey: "test",
+    fetchImpl: async (_url, options) => { body = JSON.parse(options.body); return { ok: true, json: async () => ({ answers: validAnswers }) }; } });
+  assert.match(body.questions.complexity.instructions, /execution continuation inherits/i);
+  assert.match(body.questions.complexity.instructions, /status-only question/i);
+  assert.match(body.questions.underspecified.instructions, /optional historical truncation/i);
+  assert.match(body.questions.task_kind.instructions, /Quoted or negated/);
+});

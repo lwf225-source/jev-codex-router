@@ -30,6 +30,23 @@ export async function readExecutionPlan(threadId, { dataDir } = {}) {
     return plans.find((p) => p.threadId === threadId) || null;
   });
 }
+/** Metadata-only lower boundary; native history must prove this registration. */
+export function executionHistoryScope(plan) {
+  if (!plan) return null;
+  const origin = Object.hasOwn(plan, "historyOrigin")
+    ? plan.historyOrigin
+    : { planId: plan.planId, createdAt: plan.createdAt };
+  const createdAtMs = Date.parse(origin?.createdAt);
+  const attempts = plan.units.flatMap((unit) => unit.attempts || []);
+  const valid = origin?.planId && Number.isFinite(createdAtMs) &&
+    createdAtMs <= Date.parse(plan.createdAt) && attempts.every((attempt) =>
+      Number.isFinite(Date.parse(attempt.createdAt)) && Date.parse(attempt.createdAt) >= createdAtMs);
+  return {
+    planId: plan.planId,
+    ...(valid ? { originPlanId: origin.planId, createdAt: origin.createdAt } : {}),
+  };
+}
+
 export async function registerExecutionPlan(
   { threadId, units, replace = false },
   { dataDir } = {},
@@ -121,6 +138,12 @@ export async function registerExecutionPlan(
       createdAt: now,
       updatedAt: now,
       units: normalized,
+      ...(normalized.some((unit) => unit.attempts.length) ? {
+        historyOrigin: (() => {
+          const scope = executionHistoryScope(previous);
+          return scope?.originPlanId ? { planId: scope.originPlanId, createdAt: scope.createdAt } : null;
+        })(),
+      } : {}),
     };
     await save(dir, [...plans.filter((p) => p.threadId !== threadId), plan]);
     return plan;
@@ -523,12 +546,25 @@ export async function reconcileExecutionPlan(
         allVerified: false,
         units: [],
       };
-    const complete =
-      !history.readError &&
-      !history.truncated &&
-      history.coverage?.parentHistory === "complete" &&
+    const scope = executionHistoryScope(plan);
+    const current = history.coverage?.currentPlan;
+    const boundary = current?.boundary;
+    const createdAtMs = Date.parse(scope?.createdAt);
+    const scopedComplete = current?.coverage === "complete" &&
+      current.planId === plan.planId && scope?.originPlanId &&
+      boundary?.originPlanId === scope.originPlanId && boundary.createdAt === scope.createdAt &&
+      Number.isFinite(boundary.startedAtMs) && Number.isFinite(boundary.completedAtMs) &&
+      boundary.startedAtMs <= createdAtMs && createdAtMs <= boundary.completedAtMs;
+    const globalComplete = !history.truncated && history.coverage?.parentHistory === "complete";
+    const complete = Boolean(
+      !history.readError && (globalComplete || scopedComplete) &&
+      !history.coverage?.omittedByLimit &&
       !history.coverage?.excludedReferences?.length &&
-      !history.coverage?.conflictedRoutingTokens?.length;
+      !history.coverage?.conflictedRoutingTokens?.length &&
+      !history.coverage?.unlinkedRoutingTokens?.length &&
+      !(history.tasks || []).some((child) => child.readError ||
+        child.resultHistoryTruncated || (child.resultCoverage && child.resultCoverage !== "complete"))
+    );
     const units = plan.units.map((unit) => {
       const attempt = unit.attempts.at(-1);
       if (!attempt)
@@ -545,7 +581,9 @@ export async function reconcileExecutionPlan(
         child &&
         !child.readError &&
         child.configuredModel === attempt.decision.model &&
-        child.configuredEffort === attempt.decision.effort;
+        child.configuredEffort === attempt.decision.effort &&
+        (!child.suggestedModel || child.suggestedModel === attempt.decision.model) &&
+        (!child.suggestedEffort || child.suggestedEffort === attempt.decision.effort);
       attempt.nativeStatus =
         complete && children.length === 0
           ? "not_dispatched"
@@ -581,6 +619,7 @@ export async function reconcileExecutionPlan(
     return {
       planId: plan.planId,
       coverage: complete ? "complete" : "incomplete",
+      coverageScope: globalComplete ? "globalHistory" : scopedComplete ? "currentPlan" : "unknown",
       allVerified: complete && units.every((u) => u.status === "verified"),
       units,
     };

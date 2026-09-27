@@ -1000,3 +1000,35 @@ test('confirmed native starts record bounded policy metadata without task conten
   for (const [key, value] of Object.entries({ taskKind: 'code', policyVersion: '2.0', nextAction: 'execute', contextComplete: true, capabilityLimited: false })) assert.equal(records[0][key], value);
   assert.doesNotMatch(JSON.stringify(records), /PRIVATE_/);
 });
+
+
+test('status interlude preserves later continuation evidence and omits staged handoff', async (t) => {
+  const seen = [];
+  const h = harness({ route: async args => {
+    seen.push(args.context);
+    return chooseRoute({ ...args, localOnly: true });
+  } });
+  t.after(h.stop); await h.ready();
+  h.proxy.contexts.set('status-interlude', { summary: 'Historical implementation. '.repeat(300),
+    lastResult: 'Tests passed; deployment and native acceptance are still pending.',
+    constraints: 'No deployment before acceptance.',
+    previousRoute: { model: 'gpt-6-astra', effort: 'high', phase: 'plan_execute', taskKind: 'architecture', highRisk: true, needsSecondOpinion: true, capabilityFloor: 3 } });
+  const text = '还有什么优化没做完？只汇报当前状态，不执行改动。';
+  h.send({ id: 390, method: 'turn/start', params: { threadId: 'status-interlude', input: [{ type: 'text', text }] } });
+  await until(() => h.upstream.some(m => m.id === 390));
+  const status = h.upstream.find(m => m.id === 390).params;
+  assert.equal(status.model, 'gpt-6-sol');
+  assert.equal(status.additionalContext.jev_routing.value, '');
+  assert.equal(status.input[0].text, text);
+  assert.equal(seen[0].previousRoute, undefined);
+  assert.equal(seen[0].constraints, 'No deployment before acceptance.');
+  await until(() => h.proxy.contexts.get('status-interlude')?.lastApplied);
+  assert.equal(h.proxy.contexts.get('status-interlude').previousRoute.highRisk, true);
+  h.child.stdout.write(`${JSON.stringify({ method: 'turn/completed', params: { threadId: 'status-interlude', turn: { id: 'turn-390', status: 'completed' } } })}\n`);
+  h.send({ id: 391, method: 'turn/start', params: { threadId: 'status-interlude', input: [{ type: 'text', text: '继续处理剩下的上线工作' }] } });
+  await until(() => h.upstream.some(m => m.id === 391));
+  assert.equal(seen[1].previousRoute.highRisk, true);
+  assert.equal(seen[1].continuation, true);
+  assert.equal(h.upstream.find(m => m.id === 391).params.model, 'gpt-6-astra');
+  assert.match(h.upstream.find(m => m.id === 391).params.additionalContext.jev_routing.value, /staged planning/);
+});

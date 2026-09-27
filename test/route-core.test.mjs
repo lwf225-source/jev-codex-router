@@ -1064,3 +1064,68 @@ test('fallback preserves an established high-risk review obligation only for con
  const changed=await chooseRoute({prompt:'New task',models,context:{goalChanged:true,previousRoute},localOnly:true});
  assert.equal(changed.needsSecondOpinion,false);
 });
+
+
+test("long-history status uses scoped Jev context and direct routing even for uncertain category", async () => {
+  let state;
+  const fetch = jev({ score: 0.4, taskKind: "unknown", staged: true });
+  const result = await chooseRoute({
+    prompt: "还有什么优化没做完", models, apiKey: "test",
+    context: { summary: "Historical architecture and deployment work. ".repeat(300),
+      lastResult: "Implementation is tested; native acceptance remains pending.",
+      constraints: "Report observed evidence only.", continuation: true,
+      previousRoute: { highRisk: true, phase: "plan_execute", taskKind: "architecture" } },
+    fetchImpl: (url, options) => { state = JSON.parse(options.body).state; return fetch(url, options); },
+  });
+  assert.equal(state.context.historyTruncated, true);
+  assert.equal(state.context.currentContextComplete, true);
+  assert.equal(state.context.contextComplete, true);
+  assert.equal(state.context.turnIntent, "status");
+  assert.ok(state.context.summary.length <= 900);
+  assert.equal(result.phase, "direct");
+  assert.equal(result.model, "gpt-6-sol");
+  assert.equal(result.effort, "medium");
+  assert.equal(result.source, "jev");
+  assert.equal(result.highRisk, false);
+  assert.equal(result.needsSecondOpinion, false);
+});
+
+test("known status fallback is balanced direct without discarding missing current evidence", async () => {
+  const context = { summary: "history ".repeat(2000), lastResult: "One unit pending.",
+    previousRoute: { highRisk: true, phase: "plan_execute", taskKind: "architecture" }, continuation: true };
+  const status = await chooseRoute({ prompt: "What is the status?", models, context, localOnly: true });
+  assert.deepEqual([status.model, status.effort, status.phase], ["gpt-6-sol", "medium", "direct"]);
+  for (const patch of [{ constraints: "must ".repeat(1000) }, { inputModalities: ["image"] }, { contextComplete: false }]) {
+    const result = await chooseRoute({ prompt: "What is the status?", models, context: { ...context, ...patch }, apiKey: "test", fetchImpl: jev() });
+    assert.equal(result.contextComplete, false);
+    assert.equal(result.model, "gpt-6-astra");
+    assert.equal(result.phase, "plan_execute");
+  }
+  const absent = await chooseRoute({ prompt: "What is the status?", models, localOnly: true });
+  assert.equal(absent.contextComplete, false);
+  assert.equal(absent.model, "gpt-6-astra");
+});
+
+test("status optimization cannot erase execution risk or override manual choices", async () => {
+  const context = { summary: "Deployment has unresolved checks.", continuation: true,
+    previousRoute: { highRisk: true, phase: "plan_execute", needsSecondOpinion: true, capabilityFloor: 3 } };
+  for (const prompt of ["Continue after reporting status", "还有什么优化没做完，继续做", "不要只说进度，执行上线", '"What is the status?"']) {
+    const result = await chooseRoute({ prompt, models, context, apiKey: "test", fetchImpl: jev() });
+    assert.equal(result.highRisk, true, prompt);
+    assert.equal(result.model, "gpt-6-astra", prompt);
+    assert.equal(result.needsSecondOpinion, true, prompt);
+  }
+  const manual = await chooseRoute({ prompt: "还有什么优化没做完", models, context,
+    settings: { manualModel: "gpt-6-astra", manualEffort: "xhigh" } });
+  assert.equal(manual.source, "manual"); assert.equal(manual.effort, "xhigh");
+});
+
+
+test("a status query with only truncated historical evidence stays conservative", async () => {
+  const result = await chooseRoute({ prompt: "还有什么优化没做完", models,
+    context: { summary: "Old implementation discussion. ".repeat(300) },
+    apiKey: "test", fetchImpl: jev({ score: 0.1, taskKind: "routine" }) });
+  assert.equal(result.contextComplete, false);
+  assert.equal(result.phase, "plan_execute");
+  assert.equal(result.model, "gpt-6-astra");
+});

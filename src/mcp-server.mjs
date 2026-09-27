@@ -19,6 +19,8 @@ import { createQueuedStore } from "./queued-submissions.mjs";
 import { inspectSubtasks } from "./subtask-history.mjs";
 import {
   registerExecutionPlan,
+  readExecutionPlan,
+  executionHistoryScope,
   recordExecutionAcceptance,
   routePlannedUnit,
   reconcileExecutionPlan,
@@ -169,6 +171,8 @@ export function createMcpServer({
         : undefined;
       return {
         routerVersion: "0.2.0",
+        historyVerificationVersion: "current-plan-boundary-v1",
+        contextCalibrationVersion: "status-scope-v1",
         policyVersion: "2.0",
         global,
         typesafeConfigured: Boolean(await readKey()),
@@ -233,7 +237,9 @@ export function createMcpServer({
       },
     },
     safely(async (args) => {
-      const history = await inspectHistory(args);
+      const plan = await readExecutionPlan(args.threadId, { dataDir });
+      const registrationScope = executionHistoryScope(plan);
+      const history = await inspectHistory({ ...args, ...(registrationScope ? { registrationScope } : {}) });
       return {
         ...history,
         executionPlan: await reconcileExecutionPlan(args.threadId, history, {

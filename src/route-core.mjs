@@ -3,6 +3,7 @@ import {
   boundPrompt,
   buildRoutingContext,
   routingTimeoutMs,
+  routingIntent,
 } from "./routing-context.mjs";
 import {
   POLICY_VERSION,
@@ -57,10 +58,14 @@ export async function chooseRoute({
         nextAction: "stop",
       },
     );
-  const bounded = buildRoutingContext(context);
-  if (String(prompt ?? "").length > 12000) bounded.contextComplete = false;
+  const statusOnly = !execution && routingIntent(prompt) === "status";
+  const bounded = buildRoutingContext(context, { statusOnly });
+  if (String(prompt ?? "").length > 12000 || String(prompt ?? "").includes("[TRUNCATED:")) {
+    bounded.contextComplete = false;
+    bounded.currentContextComplete = false;
+  }
   const prior =
-    context.continuation === true && context.goalChanged !== true
+    !statusOnly && context.continuation === true && context.goalChanged !== true
       ? context.previousRoute
       : null;
   const select = (tier, kind, stage) =>
@@ -154,7 +159,8 @@ export async function chooseRoute({
     const taskKind =
       prior?.taskKind ||
       (TASK_KINDS.includes(context.taskKind) ? context.taskKind : "unknown");
-    const known =
+    const knownStatus = statusOnly && bounded.contextComplete;
+    const known = knownStatus ||
       bounded.contextComplete &&
       (context.contextComplete === true || prior?.contextComplete === true) &&
       taskKind !== "unknown";
@@ -163,7 +169,7 @@ export async function chooseRoute({
       prior?.highRisk ||
       ["plan_execute", "planning_only"].includes(prior?.phase) ||
       prior?.capabilityFloor >= 3;
-    const tier = strong
+    const tier = knownStatus ? "balanced" : strong
       ? "strong"
       : taskKind === "routine"
         ? "light"
@@ -190,7 +196,7 @@ export async function chooseRoute({
                 : settings.fallbackEffort || "medium"),
       "fallback",
       {
-        taskKind,
+        taskKind: knownStatus ? "routine" : taskKind,
         phase: execution ? "execution" : strong ? "plan_execute" : "direct",
         highRisk: prior?.highRisk === true,
         needsSecondOpinion: needsReview,
@@ -209,21 +215,24 @@ export async function chooseRoute({
     );
   }
   const taskKind = judgment.taskKind;
-  const highRisk = judgment.highConsequence >= 0.65;
+  const highRisk = prior?.highRisk === true || judgment.highConsequence >= 0.65;
   const complex =
+    prior?.capabilityFloor >= 3 ||
     judgment.complexity >= 2.35 ||
     (judgment.complexity >= 1.65 && (highRisk || judgment.confidence < 0.55));
   const incomplete =
     !bounded.contextComplete || judgment.underspecified >= 0.65;
+  const statusDirect = statusOnly && !incomplete && !highRisk;
   const uncertainRouting = taskKind === "unknown" || judgment.confidence < 0.55;
   const tier =
-    complex || highRisk || incomplete || uncertainRouting
+    complex || highRisk || incomplete || (uncertainRouting && !statusDirect)
       ? "strong"
-      : judgment.complexity >= 0.85
+      : judgment.complexity >= 0.85 || (statusDirect && uncertainRouting)
         ? "balanced"
         : "light";
   const staged =
-    !execution && (judgment.staged || incomplete || uncertainRouting);
+    !execution && !statusDirect && (judgment.staged || incomplete || uncertainRouting ||
+      ["plan_execute", "planning_only"].includes(prior?.phase));
   const stage = execution
     ? "execution"
     : staged
@@ -243,7 +252,7 @@ export async function chooseRoute({
           ? "medium"
           : "low";
   const needsSecondOpinion =
-    staged && (judgment.needsSecondOpinion || highRisk);
+    staged && (judgment.needsSecondOpinion || highRisk || prior?.needsSecondOpinion === true);
   const verifier = needsSecondOpinion ? alternateStrong(catalog, model) : null;
   return finish(model, desired, "jev", {
     confidence: judgment.confidence,

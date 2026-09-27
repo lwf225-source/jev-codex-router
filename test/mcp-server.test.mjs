@@ -634,3 +634,36 @@ test("planned route total deadline prevents a late execution attempt", async () 
       await server.close();
     }
   }));
+
+test('subtask_history uses persisted registration metadata and status identifies loaded verification behavior', async () =>
+  temporary(async (dataDir) => {
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    let received;
+    const server = createMcpServer({
+      dataDir, readKey: async () => null,
+      inspectHistory: async (args) => {
+        received = args;
+        return { threadId: args.threadId, tasks: [], coverage: { parentHistory: 'unknown' }, truncated: true };
+      },
+    });
+    const client = new Client({ name: 'history-scope-test', version: '1' });
+    try {
+      await server.connect(b);
+      await client.connect(a);
+      const plan = (await client.callTool({ name: 'register_execution_plan', arguments: {
+        threadId: 'scope-parent', units: [{ unitId: 'one', task: 'Private task', acceptanceCriteria: 'Private criteria' }],
+      } })).structuredContent;
+      await client.callTool({ name: 'subtask_history', arguments: { threadId: 'scope-parent' } });
+      assert.deepEqual(received.registrationScope, {
+        planId: plan.planId, originPlanId: plan.planId, createdAt: plan.createdAt,
+      });
+      assert.equal(JSON.stringify(received).includes('Private'), false);
+      const status = (await client.callTool({ name: 'status', arguments: {} })).structuredContent;
+      assert.equal(status.historyVerificationVersion, 'current-plan-boundary-v1');
+      assert.equal(status.contextCalibrationVersion, 'status-scope-v1');
+      assert.equal(status.routerVersion, '0.2.0');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  }));

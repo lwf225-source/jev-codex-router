@@ -49,7 +49,7 @@ function flattenLegacy(thread, maxItems) {
   return { entries, pagesRead: 0, truncated, complete: !truncated, source: 'legacyTurns' };
 }
 
-async function readHistory(thread, { readThread, readItems, pageSize, maxPages }) {
+async function readHistory(thread, { readThread, readItems, pageSize, maxPages, registrationScope }) {
   const maxItems = pageSize * maxPages;
   if (thread.historyMode === 'legacy' || (!thread.historyMode && thread.turns?.length)) {
     let hydrated = thread;
@@ -75,9 +75,19 @@ async function readHistory(thread, { readThread, readItems, pageSize, maxPages }
         throw new Error('History pagination response omitted a valid nextCursor');
       }
       const next = text(page.nextCursor);
+      if (next && cursors.has(next)) throw new Error('History pagination repeated a cursor');
+      if (!overflow && registrationScope) {
+        const index = entries.findIndex((entry) => registrationBoundary(entry, thread.id, registrationScope));
+        if (index >= 0) {
+          const boundary = registrationBoundary(entries[index], thread.id, registrationScope);
+          const truncated = index < entries.length - 1 || Boolean(next);
+          // Do not discover children or conflicting tokens from ancient plans.
+          return { entries: entries.slice(0, index + 1), pagesRead, truncated,
+            complete: !truncated, source: 'itemsList', thread, boundary };
+        }
+      }
       if (overflow) return { entries, pagesRead, truncated: true, complete: false, source: 'itemsList', thread };
       if (!next) return { entries, pagesRead, truncated: false, complete: true, source: 'itemsList', thread };
-      if (cursors.has(next)) throw new Error('History pagination repeated a cursor');
       cursors.add(next);
       cursor = next;
     }
@@ -94,15 +104,39 @@ async function readHistory(thread, { readThread, readItems, pageSize, maxPages }
   }
 }
 
-function routeSuggestion(item) {
-  if (item?.type !== 'mcpToolCall' || item.server !== 'jev-router' || item.tool !== 'route_execution_subtask'
-    || item.status !== 'completed' || item.error || item.result?.isError) return null;
+function successfulResults(item, tool) {
+  if (item?.type !== 'mcpToolCall' || item.server !== 'jev-router' || item.tool !== tool
+    || item.status !== 'completed' || item.error || item.result?.isError) return [];
   const possibilities = [item.result?.structuredContent];
   for (const entry of item.result?.content || []) {
     if (entry?.type !== 'text' || typeof entry.text !== 'string') continue;
-    try { possibilities.push(JSON.parse(entry.text)); } catch { /* Non-JSON tool text is not a route record. */ }
+    try { possibilities.push(JSON.parse(entry.text)); } catch { /* Not a JSON tool record. */ }
   }
-  return possibilities.find((value) => value && !value.isError && ROUTING_TOKEN.test(value.routingToken) && text(value.model)) || null;
+  return possibilities.filter((value) => value && !value.isError);
+}
+
+function registrationBoundary(entry, threadId, scope) {
+  const createdAtMs = Date.parse(scope.createdAt);
+  const { startedAtMs, completedAtMs } = entry;
+  if (!scope.originPlanId || !Number.isFinite(createdAtMs) ||
+    !Number.isFinite(startedAtMs) || !Number.isFinite(completedAtMs) ||
+    startedAtMs > createdAtMs || completedAtMs < createdAtMs) return null;
+  const item = entry.item;
+  let args = item?.arguments;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { return null; }
+  }
+  if (args?.threadId !== threadId) return null;
+  const values = successfulResults(item, 'register_execution_plan');
+  if (!values.length || values.some((value) => value.planId !== scope.originPlanId ||
+    (value.threadId && value.threadId !== threadId) ||
+    (value.createdAt && value.createdAt !== scope.createdAt))) return null;
+  return { originPlanId: scope.originPlanId, createdAt: scope.createdAt, startedAtMs, completedAtMs };
+}
+
+function routeSuggestion(item) {
+  return successfulResults(item, 'route_execution_subtask')
+    .find((value) => ROUTING_TOKEN.test(value.routingToken) && text(value.model)) || null;
 }
 
 function taskName(child, candidate) {
@@ -186,7 +220,7 @@ function configuredMatches(suggestion, thread) {
  * configured values; native thread metadata is not execution telemetry.
  * No prompts/results are written to disk, and no task is started or resumed.
  */
-export async function inspectSubtasks({ threadId, limit = 20, includeResults = false, readThread, readItems } = {}) {
+export async function inspectSubtasks({ threadId, limit = 20, includeResults = false, readThread, readItems, registrationScope } = {}) {
   if (!text(threadId) || threadId.length > 200 || /[\s\u0000-\u001f]/.test(threadId)) throw new Error('threadId must be a non-empty thread identifier');
   if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error('limit must be an integer between 1 and 50');
   if (typeof includeResults !== 'boolean') throw new Error('includeResults must be a boolean');
@@ -196,7 +230,7 @@ export async function inspectSubtasks({ threadId, limit = 20, includeResults = f
     tasks: [],
     truncated: false,
     coverage: {
-      historyMode: 'unknown', parentHistory: 'unknown', parentItemsRead: 0, parentPagesRead: 0,
+      historyMode: 'unknown', parentHistory: 'unknown', globalHistory: 'unknown', parentItemsRead: 0, parentPagesRead: 0,
       parentItemLimit: PARENT_PAGE_SIZE * PARENT_MAX_PAGES, childLimit: limit, candidateCount: 0,
       omittedByLimit: 0, excludedReferences: [], ignoredParentReferences: 0,
       unlinkedRoutingTokens: [], conflictedRoutingTokens: [],
@@ -212,8 +246,14 @@ export async function inspectSubtasks({ threadId, limit = 20, includeResults = f
     const parent = unwrapThread(await readThread({ threadId, includeTurns: false }));
     if (parent?.id !== threadId) throw new Error('Parent thread response did not match the requested thread');
     report.coverage.historyMode = text(parent.historyMode) || 'unknown';
-    const history = await readHistory(parent, { readThread, readItems, pageSize: PARENT_PAGE_SIZE, maxPages: PARENT_MAX_PAGES });
+    const history = await readHistory(parent, { readThread, readItems, pageSize: PARENT_PAGE_SIZE, maxPages: PARENT_MAX_PAGES, registrationScope });
     report.coverage.parentHistory = history.complete ? 'complete' : 'unknown';
+    report.coverage.globalHistory = history.complete ? 'complete' : history.readError ? 'unknown' : 'truncated';
+    if (registrationScope) report.coverage.currentPlan = {
+      planId: registrationScope.planId,
+      coverage: history.boundary ? 'complete' : 'incomplete',
+      ...(history.boundary ? { boundary: history.boundary } : { reasonCode: 'registration_boundary_unproven' }),
+    };
     report.coverage.parentItemsRead = history.entries.length;
     report.coverage.parentPagesRead = history.pagesRead;
     report.truncated = history.truncated;

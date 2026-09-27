@@ -4,7 +4,7 @@ import { chooseRoute, detectExplicitOverride } from './route-core.mjs';
 import { readTypeSafeKey } from './credential.mjs';
 import { getThreadSettings, updateThreadSettings } from './settings.mjs';
 import { appendRouteRecord } from './audit-log.mjs';
-import { boundPrompt, routingTimeoutMs } from './routing-context.mjs';
+import { boundPrompt, routingTimeoutMs, routingIntent } from './routing-context.mjs';
 import { createQueuedStore } from './queued-submissions.mjs';
 
 const MAX_CONTEXT = 4500;
@@ -12,7 +12,7 @@ const DEFAULT_ROUTE_WAIT_MS = 2000;
 const MAX_ROUTE_WAIT_MS = 10000;
 const routeBudget = settings => Math.min(MAX_ROUTE_WAIT_MS, Math.max(100, routingTimeoutMs(settings?.timeoutMs)));
 const headTail = boundPrompt;
-const explicitContinuation = prompt => /^(?:continue(?:\s+(?:the task|implementation|work))?|resume(?:\s+(?:the task|implementation|work))?|proceed|继续(?:执行|任务|优化|修复|实施)?|接着(?:做|执行)?)[.!。！\s]*$/i.test(prompt.trim());
+const explicitContinuation = prompt => routingIntent(prompt) === 'continuation';
 const INTERNAL_REQUEST_TIMEOUT_MS = 450;
 
 function parseLine(line) {
@@ -204,7 +204,7 @@ export function createAppServerProxy({
         'An idempotent route can return reused=true with the existing routingToken. Never blindly spawn again for a reused decision: query subtask_history first. If the linked native child already started or completed, retain that child. Only when complete, untruncated history proves not_dispatched may you use the current valid token to dispatch once. If dispatch status is uncertain, stop and resolve that uncertainty.',
         'Classify failures before retry: capability, environment/dependency, permission, transient service, invalid plan, missing information or unknown. Retry routing with the same unitId, explicit retry=true, previousModel, previousEffort, failureCategory and concise failureSummary. At most two execution attempts per unit. Only capability failures justify escalation. Repair environment failures, stop blocked permission work, replan invalid plans and request missing context. For unknown launch state or possible external effects, verify native completion before any retry.',
         'Use a source=fallback route if the MCP returns one. A tool error without a valid model/effort pair is not a route: report it rather than inventing a configuration. When escalated=false after a failed attempt, return to planning instead of repeating the same failed route indefinitely.',
-        `Before reporting the execution complete, use the read-only subtask_history tool with threadId=${params.threadId} to check linked children and their recorded status. Treat read errors, truncated history, unlinked routing tokens, or configuredMatchesSuggestion=false as unresolved evidence to investigate. Current configured models are not per-turn execution telemetry. Verify the actual deliverable and acceptance criteria separately; a completed child or a model match alone does not prove acceptance. Record acceptance through record_execution_acceptance only after checking native completion/configuration and the actual deliverable. Require allVerified before declaring the registered plan fully verified; missing units, duplicate tokens, pending acceptance and unknown status remain unresolved. This is observed execution plus declared acceptance, not hard tool interception. If the history tool is unavailable, report the verification gap honestly.`,
+        `Before reporting the execution complete, use the read-only subtask_history tool with threadId=${params.threadId} to check linked children and their recorded status. Treat read errors, truncated child evidence, unlinked routing tokens, or configuredMatchesSuggestion=false as unresolved evidence to investigate. Older global-history truncation may be scoped out only when coverage.currentPlan proves the registration boundary with coverage=complete and the authoritative executionPlan has coverage=complete, coverageScope=currentPlan, and allVerified=true. The currentPlan parent-interval proof alone does not prove child completion or acceptance; missing boundaries or truncated child results remain unresolved. Report scoped completion separately from incomplete global history. Current configured models are not per-turn execution telemetry. Verify the actual deliverable and acceptance criteria separately; a completed child or a model match alone does not prove acceptance. Record acceptance through record_execution_acceptance only after checking native completion/configuration and the actual deliverable. Require allVerified before declaring the registered plan fully verified; missing units, duplicate tokens, pending acceptance and unknown status remain unresolved. This is observed execution plus declared acceptance, not hard tool interception. If the history tool is unavailable, report the verification gap honestly.`,
       ].join(' ');
       next.additionalContext.jev_routing.value = handoffInstructions;
     }
@@ -254,6 +254,16 @@ export function createAppServerProxy({
     }
   }
 
+  function contextSnapshot(current, prompt, input) {
+    return {
+      summary: current.summary || '', progress: current.progress || '', lastResult: current.lastResult || '',
+      ...Object.fromEntries(['constraints', 'failureSummary', 'acceptanceCriteria', 'dependencies', 'goal', 'stage', 'contextComplete']
+        .filter(key => current[key] !== undefined).map(key => [key, current[key]])),
+      inputModalities: inputModalities(input), attachmentsReadable: !inputModalities(input).includes('image'),
+      ...(explicitContinuation(prompt) && current.previousRoute ? { previousRoute: current.previousRoute, continuation: true } : {}),
+    };
+  }
+
   async function contextFor(threadId, prompt, input, deadline = Infinity) {
     const existing = contexts.get(threadId) || {};
     if (!existing.summary && initialized) {
@@ -261,14 +271,7 @@ export function createAppServerProxy({
       observeHistory(threadId, history?.thread?.turns);
     }
     const current = contexts.get(threadId) || {};
-    return {
-      summary: current.summary || '',
-      progress: current.progress || '',
-      lastResult: current.lastResult || '',
-      inputModalities: inputModalities(input),
-      attachmentsReadable: !inputModalities(input).includes('image'),
-      ...(explicitContinuation(prompt) && current.previousRoute ? { previousRoute: current.previousRoute, continuation: true } : {}),
-    };
+    return contextSnapshot(current, prompt, input);
   }
 
   async function routeInput(threadId, input, params, deadline, preparation = {}) {
@@ -285,11 +288,7 @@ export function createAppServerProxy({
     }
     preparation.catalog = catalog;
     const state = contexts.get(threadId) || {};
-    let context = {
-      summary: state.summary || '', progress: state.progress || '', lastResult: state.lastResult || '',
-      inputModalities: inputModalities(input), attachmentsReadable: !inputModalities(input).includes('image'),
-      ...(explicitContinuation(prompt) && state.previousRoute ? { previousRoute: state.previousRoute, continuation: true } : {}),
-    };
+    let context = contextSnapshot(state, prompt, input);
     if (!preparation.localOnly && remaining(end)) context = await within(contextFor(threadId, prompt, input, end), end, context);
     const selected = observedSelection(params);
     const explicitlyRequested = detectExplicitOverride(prompt, catalog, context);
@@ -342,7 +341,8 @@ export function createAppServerProxy({
     const { result, prompt } = routed;
     const state = contexts.get(threadId) || {};
     state.lastApplied = { model: result.model, effort: result.effort };
-    state.previousRoute = { model: result.model, effort: result.effort, phase: result.phase, taskKind: result.taskKind, highRisk: result.highRisk, needsSecondOpinion: result.needsSecondOpinion, capabilityFloor: result.capabilityFloor, complexity: result.complexity, contextComplete: result.contextComplete };
+    // A progress interlude must not erase safety evidence for a later Continue.
+    if (routingIntent(prompt) !== 'status') state.previousRoute = { model: result.model, effort: result.effort, phase: result.phase, taskKind: result.taskKind, highRisk: result.highRisk, needsSecondOpinion: result.needsSecondOpinion, capabilityFloor: result.capabilityFloor, complexity: result.complexity, contextComplete: result.contextComplete };
     state.summary = capped([state.summary, `用户：${capped(prompt || '[图片]', 600)}`].filter(Boolean).join('\n'));
     contexts.set(threadId, state);
     try { await announce({ threadId, model: result.model, effort: result.effort, source: result.source, reason: visibleReason(result.reason) }); }
