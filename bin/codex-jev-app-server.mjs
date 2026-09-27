@@ -1,10 +1,11 @@
 #!/usr/bin/env node
+import { resolveNativeCodexBinary } from '../src/native-binary.mjs';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { createAppServerProxy } from '../src/app-server-proxy.mjs';
 import { announceRoute } from '../src/desktop-notice.mjs';
 
-const nativeCodex = process.env.CODEX_JEV_REAL_CLI || '/Applications/ChatGPT.app/Contents/Resources/codex';
+const nativeCodex = resolveNativeCodexBinary();
 const args = process.argv.slice(2);
 const childEnv = { ...process.env };
 delete childEnv.CODEX_CLI_PATH;

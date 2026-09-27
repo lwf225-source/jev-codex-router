@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveNativeCodexBinary } from '../src/native-binary.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { access, chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -14,7 +15,7 @@ const launcher = join(dataDir, 'codex-app-server.sh');
 const marker = join(dataDir, 'install.json');
 const agentFile = join(homedir(), 'Library', 'LaunchAgents', 'ai.typesafe.codex-jev-router-env.plist');
 const pruneAgentFile = join(homedir(), 'Library', 'LaunchAgents', 'ai.typesafe.codex-jev-router-prune.plist');
-const codexNative = '/Applications/ChatGPT.app/Contents/Resources/codex';
+const codexNative = resolveNativeCodexBinary();
 const proxyEntry = join(project, 'bin', 'codex-jev-app-server.mjs');
 const mcpEntry = join(project, 'bin', 'jev-router-mcp.mjs');
 const pruneEntry = join(project, 'scripts', 'prune-logs.mjs');

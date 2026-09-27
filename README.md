@@ -1,89 +1,119 @@
 # Jev Model Router for Codex
 
-> An experimental TypeSafe Jev-powered task router for the Codex Desktop app. Choose a model and reasoning effort for each new task, send complex work through stronger planning and optional review, then delegate bounded execution to cost-effective Codex subagents.
+An experimental model router for Codex Desktop, powered by TypeSafe Jev. Use stronger models for uncertain decisions and complex planning, then route well-defined execution work to suitable Codex subagents.
 
-Jev Codex Router connects TypeSafe Jev to Codex Desktop through a local MCP server and an `app-server` wrapper. Simple requests can go straight to an execution model. Complex tasks can use a stronger planner and, when useful, a second-model review. Jev selects from models available to the current Codex account and assigns a supported reasoning effort. If Jev times out or fails, the router uses the configured fallback (Sol / medium by default).
+The integration combines a local MCP server with an `app-server` wrapper. Jev evaluates the task; configurable code selects an available model and supported reasoning effort. A routing decision is a recommendation, not proof that a child ran or that its deliverable passed review.
 
-- **Task-aware routing:** choose an available model and reasoning effort for each new turn.
-- **Planning and review:** reserve stronger models for complex, high-impact, or ambiguous work.
-- **Subagent routing:** select a model for each bounded execution task and escalate after failures.
-- **Codex integration:** use an MCP server, an `app-server` wrapper, queue controls, and native task history.
+This is an independent community project, not affiliated with OpenAI. Desktop compatibility depends on the installed Codex build. Token savings and cost savings have not been measured.
 
-**Status:** 114 automated tests pass. The full native desktop planning-to-subagent workflow remains experimental and still needs end-to-end desktop acceptance. This is an independent community project and is not affiliated with OpenAI.
+## Version 0.2 behavior
 
-## Validation status
+- **Task-specific selection.** One Jev request evaluates task type, complexity, consequence, missing information, planning, and review. Types cover routine actions, coding, diagnosis, writing, research, architecture, review, and unknown work. Policy profiles constrain model selection; no fabricated prices or success rates are used.
+- **Independent reasoning effort.** Planning does not automatically select `xhigh`. Clear routine work uses low effort; ordinary work and clear planning use medium; difficult, important, or uncertain decisions use high. Automatic `xhigh` requires complexity at least 2.65/3, complexity confidence at least 0.65, and diagnosis, architecture, or review work. Explicit user settings take precedence.
+- **Evidence-aware fallback.** The default total routing budget is 2,000 ms, configurable from 100 to 10,000 ms. Preparation and Jev judgment share the budget. Known ordinary work may use the configured balanced fallback; unknown or complex work retains a strong planning configuration. Previous safety evidence is reused only for an explicit continuation of the same task.
+- **Classified retries.** Capability failures can escalate. Environment failures request repair; permission failures stop; plan failures request replanning; missing information requests context. Unknown launch state or possible external effects require a completion check before retry. Registered execution units permit at most two execution attempts.
+- **Observable handoffs.** A registered plan links execution units to routing decisions and native children. Native completion and model configuration are checked separately from the main agent's delivery acceptance. The wrapper supplies instructions and evidence checks; it does not intercept every native tool call.
 
-- `npm test`: 114 tests pass, covering direct and staged routing, plan review, subtask model selection, retry escalation, routing-context cleanup, MCP tools, local logs, and queue recovery.
-- `npm run check:stage` and `npm run check:stage -- --review`: the staged App Server test flow passes. Astra / high is used for planning; the review path assigns Sol / high; live Jev selected Sol / medium for an execution subtask, and the native subagent configuration was read back successfully. The staged planner is a test fixture, so this does not prove full desktop end-to-end behavior.
-- `npm run check:mcp`: live Jev judgments passed through the STDIO MCP flow for the main task and execution subtasks across seven native Codex models. Subtask prompt text is not written to the routing log.
-- `npm run check:app-server`: a temporary task ran through the real wrapper, and the model and reasoning configuration matched the result read from Codex `thread/read`.
-- `npm run check:queue`: a persistent test task accepted a queued message during execution. After the previous turn ended, the wrapper routed the final queued input and started the next turn. Both turns completed, the queue returned to zero, and the test task was archived.
-- `npm run check:controls`: a native test task verified persistent manual selection, returning to automatic routing, a one-turn override, and disabling routing for that task. The six native records showed the expected model and reasoning effort; the test task was archived afterward.
-- `npm run eval:samples`: 21/21 model-effort choices, 21/21 stage choices, and 6/6 second-review decisions matched the sample expectations. That run had no fallbacks and averaged about 617 ms for Jev responses; this is a sample result, not a latency guarantee.
-
-**Still awaiting desktop acceptance:** the complete native planner → Jev MCP → differentiated subagent workflow, notification behavior, model-picker manual takeover, and enabling automatic routing by default for all projects. The current wrapper uses `CODEX_CLI_PATH`, which was found in the desktop launch path but is not listed among stable public environment variables. Recheck compatibility after Codex Desktop updates.
+Unknown task categories use a conservative configuration. They do not alone block a fully specified execution task. Missing required information, unread attachments, or truncated context can return `needs_context`. When available models cannot meet the required capability or effort, the decision is marked limited.
 
 ## Installation
 
-Requirements: macOS, a signed-in Codex Desktop app, Node.js, and a TypeSafe API key. Set `TYPESAFE_API_KEY` or store the key in the macOS Keychain under the service name `Codex TypeSafe API Key` for the current user. The key is read into memory; routing logs do not store prompts, full conversations, or credentials.
+Use macOS with a signed-in Codex Desktop app and Node.js (validation uses Node.js 24). A TypeSafe API key must be available through `TYPESAFE_API_KEY` or the macOS Keychain service `Codex TypeSafe API Key` for the current user.
 
 ```bash
-npm install
+git clone https://github.com/lwf225-source/jev-codex-router.git
+cd jev-codex-router
+npm ci
 node scripts/manage-install.mjs --dry-run
 npm run install:local
 ```
 
-The installer registers the `jev-router` MCP server, installs the local `app-server` launch wrapper, and configures `CODEX_CLI_PATH` for the login session. Restart Codex Desktop to load the new environment and MCP server. Automatic routing is disabled by default in a fresh installation. A settings readback alone is not end-to-end acceptance.
+The installer registers the `jev-router` MCP server, installs a launch wrapper, and configures `CODEX_CLI_PATH` for the login session. Restart Codex Desktop to load a changed wrapper and MCP tool schema. Fresh installations default to automatic routing disabled; existing settings are preserved. The `CODEX_JEV_REAL_CLI` override is honored, with known desktop bundle locations used when it is absent.
 
-After installation, use MCP tools such as `status`, `available_models`, `route_preview`, `route_execution_subtask`, `settings`, `thread_settings`, `feedback`, `recent_routes`, `last_decision`, and `queue_status` to manage and inspect routing. `route_execution_subtask` accepts a planned work unit and its acceptance criteria, then returns a native model and reasoning effort. A retry can include the previous model and a failure summary so Jev can raise the capability level. Subtask records contain the model, effort, phase, fallback status, and escalation flag, not task text.
-
-`thread_settings` can enable or disable routing for one task; manual model selection stays active until automatic mode is restored. `route_preview` does not start a Codex task or log the supplied prompt. `last_decision` gives a short explanation based on fixed reason codes and can target a specific `threadId`. `queue_status` reports queued-item counts and unconfirmed starts without exposing queued prompt text.
-
-### View subagent tasks
-
-From the project directory, run:
-
-```bash
-npm run subtasks -- --thread <parent-thread-id>
-```
-
-This lists the parent's direct children, including active and completed tasks, their names and IDs, the model assigned at dispatch, and the latest configuration. Add `--results` for bounded results or `--json` for structured output. Codex can also call the MCP `subtask_history` tool with the same parent thread ID. Restart Codex Desktop to load the new MCP tool; the local command works immediately.
-
-The query uses Codex's native local history interface. It reads only the specified parent and its direct children; it does not start, resume, or change tasks, call Jev, or save conversation transcripts. It reads at most 500 parent activities and 20 child tasks by default. Truncation and read failures are reported explicitly; an incomplete read must not be treated as proof that no history exists.
-
-`route_execution_subtask` returns a `routeId` and `routingToken`. Use the `routingToken` as `spawn_agent.task_name` to link a recommendation to the exact child task. Results distinguish the recommendation, dispatched configuration, and latest native configuration. Mismatches, duplicate IDs, and unlinked recommendations are shown explicitly; old records without a token are not guessed. The latest configuration comes from native task metadata, not per-turn execution telemetry. A completed child task does not by itself mean its deliverable passed review.
-
-To disable the integration and restore the original launch path:
+`CODEX_CLI_PATH` is an experimental desktop integration point. A successful installation or settings readback does not establish desktop end-to-end acceptance. Revalidate after desktop updates.
 
 ```bash
 npm run uninstall:local
 ```
 
-The uninstaller removes this project's MCP registration, login environment entry, and wrapper. Local settings and routing records from the last 30 days remain. Restart Codex Desktop for the change to take effect. Keep the project directory and Node.js path available after installation. Before moving either path, uninstall from the old location and install from the new one.
+Uninstall removes this integration's MCP registration, launch environment entry, and wrapper. Local settings and retained metadata remain. Restart Codex Desktop afterward. Before relocating the project or Node executable, uninstall from the old location and reinstall from the new location.
 
-## Routing behavior
+## Routing and settings
 
-At the start of each new user turn, the router reads the native `model/list` or uses the current list cached by the same process. In one request, Jev evaluates task complexity, consequences, missing information, whether staged planning is needed, and whether a second opinion is useful. Code restricts the result to models and reasoning efforts available to the current account.
+Use `status`, `available_models`, `route_preview`, `settings`, `thread_settings`, `last_decision`, `recent_routes`, and `feedback` through MCP. `route_preview` does not start a Codex task. `thread_settings` supports automatic routing, persistent manual selection, and a per-task enable override. Plan-only mode remains plan-only. Steering an active turn is forwarded unchanged; a new `turn/start` triggers a new decision.
 
-Simple, clear tasks go directly to an execution model. Complex, long-running, ambiguous, or high-impact tasks can use a stronger planner and receive collaboration guidance for the turn. Once the plan has clear steps, dependencies, and acceptance criteria, the main agent can request a second strong-model review according to risk. It then calls `route_execution_subtask` for each bounded unit and passes the returned model and `reasoning_effort` to native `spawn_agent`. The default is one execution subagent; parallel agents are used only for independent work. If execution fails, Jev receives the previous configuration and a failure summary and can escalate the model or reasoning effort. Codex's plan-only mode remains plan-only and does not automatically dispatch execution agents. An explicit one-turn model instruction takes precedence over automatic routing. An in-progress `turn/steer` is forwarded unchanged; routing is reconsidered at the next `turn/start`.
+The optional `routingPolicy` setting supports `tiers`, `tasks`, `stages`, and `models`. Preferences contain known model families or exact native model IDs; declared capabilities range from 1 to 3. Entries are intersected with the native account catalog. Unknown models are not silently treated as cheap alternatives, and a larger version number alone does not establish better capability.
 
-The native App Server may run its own queue after the previous turn ends, even when the client does not send an interceptable `thread/queue/start`. The wrapper handles queue additions, edits, deletion, reordering, and listing, and stores queue state in a file with `0600` permissions. When an item is ready to run, it routes the final input before sending `turn/start`. The item is removed from the queue state only after the native task confirms receipt. If the start response is lost, the wrapper checks the native `clientId` and task history. If it still cannot confirm whether the task started, it keeps a pending-check marker and blocks automatic retry to avoid duplicate execution. This queue-state file is separate from routing logs; queued prompt text is stored only while the item remains queued.
+Example MCP `settings` arguments:
 
-If a TypeSafe request fails or exceeds the 2-second timeout, the router uses the configured fallback, Sol / medium by default. The wrapper retains a small amount of same-task context in memory for follow-ups such as “continue.” Routing logs keep only the model, effort, phase, reason code, duration, fallback and escalation flags, and optional feedback; they do not store full prompts or conversations. A daily login task removes routing records older than 30 days.
+```json
+{
+  "timeoutMs": 2000,
+  "routingPolicy": {
+    "tasks": { "writing": ["sol", "terra", "astra", "luna"] },
+    "stages": { "planning": ["astra", "sol"] }
+  }
+}
+```
 
-## Development checks
+Responses retain `model`, `effort`, `source`, and `phase` and add `taskKind`, `policyVersion`, `reasonCode`, `contextComplete`, `capabilityLimited`, and `nextAction`. Consumers must check `nextAction` before dispatch:
+
+| nextAction | Required behavior |
+| --- | --- |
+| `execute` | Execute the bounded unit using the returned configuration |
+| `repair_environment` | Resolve the environment or dependency problem first |
+| `needs_context` | Supply missing information or verify uncertain execution state |
+| `replan` | Revise the plan or address a capability limitation |
+| `stop` | Do not start another execution attempt |
+
+A returned model is not permission to execute when `nextAction` says otherwise. Default routing time remains two seconds; a slower service can produce frequent safe fallbacks. Increase the setting only when the added wait is acceptable.
+
+## Native execution handoff
+
+1. Call `register_execution_plan` with `threadId` and `units`. Each unit needs a stable `unitId`, `task`, `acceptanceCriteria`, and optional dependency unit IDs. Registration does not dispatch work. Changed plans require explicit replacement; unresolved work cannot be silently discarded, and unchanged units retain their attempt history.
+2. Call `route_execution_subtask` with the same unit ID, task, and criteria, plus relevant plan context. Pass `model` and `effort` to native `spawn_agent`, use the returned `routingToken` as its task name, and use `fork_turns="none"` with a self-contained assignment.
+3. Honor `nextAction`. A repeated request retains its route identity. When `reused` or `dispatchNeedsCheck` is returned, inspect native history before dispatch. Keep an existing child; only complete evidence of `not_dispatched` permits the first dispatch with that token.
+4. Read `subtask_history` after execution. Native completion and matching configuration must be observed before calling `record_execution_acceptance` with `threadId`, `unitId`, `routeId`, `accepted`, and an explicit verification summary in `evidence`.
+5. Read `subtask_history` again. Its `executionPlan` distinguishes native observations from the main agent's acceptance declaration. Missing children, conflicting tokens, configuration drift, truncated history, read errors, or missing acceptance cannot produce `allVerified: true`.
+
+Use one execution child by default, with parallel children only for independent work. A rejected completed deliverable can be retried when the failure is classified and the previous execution is known. Retry arguments include `retry`, `attempt`, `failureCategory`, `failureSummary`, `launchState`, and `possibleExternalEffects`; registered attempts use the stored previous configuration and authoritative attempt count.
+
+Failure categories are `capability`, `environment`, `permission`, `transient`, `plan`, `missing_information`, and `unknown`. Only `capability` automatically raises capability. A confirmed transient failure can request one same-configuration retry. A non-execution decision consumes no execution attempt.
+
+Legacy unregistered calls still receive routing advice, but their handoff coverage is incomplete. A main agent's acceptance remains a declaration about its checks, not independent proof of semantic correctness.
+
+## Context, queues, and privacy
+
+The router sends the current prompt and bounded same-task context to TypeSafe. It does not automatically read project files or send attachment bytes. Structured context can contain `goal`, `constraints`, `phase`, `dependencies`, `acceptanceCriteria`, `lastResult`, and `attachmentStatus` (`none`, `readable`, `unreadable`, or `unknown`). It also accepts bounded legacy summary/progress fields. Unread attachments are explicitly marked as missing information.
+
+Main-task prompt text is capped at 12,000 characters using head/tail retention and a truncation marker. Context fields share an approximately 4,500-character text budget, prioritizing explicit constraints and recent failure evidence. The full original input still goes to native Codex; a bounded router view must not silently rewrite the user's task.
+
+Routing logs retain configuration, fixed reason codes, policy metadata, timing, fallback/escalation flags, and optional feedback. Execution-plan records store identifiers, dependencies, state, configuration, timestamps, and hashes of task/acceptance/evidence text. They do not persist that text. Metadata is written atomically with `0600` file permissions and retained for 30 days.
+
+The queue state is separate: it temporarily holds queued input in a `0600` file. Final queued input is routed before native execution, and removed only after receipt is confirmed. An unconfirmed start requires checking native `clientId` and history before automatic retry. `queue_status` reports counts and uncertain starts without exposing queued prompt text.
+
+```bash
+npm run subtasks -- --thread <parent-thread-id>
+npm run subtasks -- --thread <parent-thread-id> --results
+npm run subtasks -- --thread <parent-thread-id> --json
+```
+
+The local history reader visits only the specified parent and its direct children. It does not start or resume tasks, call Jev, or persist transcripts. Reads are bounded, and incomplete evidence is explicit. For registered-plan acceptance use MCP `subtask_history`, which also reconciles the execution plan.
+
+## Validation
 
 ```bash
 npm test
 npm run check:mcp
+npm run check:mcp -- --timeout-ms=10000
+npm run check:stage -- --timeout-ms=10000
+npm run check:stage -- --review --timeout-ms=10000
 npm run check:app-server
-npm run check:stage
-npm run check:stage -- --review
 npm run check:queue
 npm run check:controls
 npm run eval:samples
 ```
 
-`check:mcp`, `check:app-server`, `check:queue`, and `check:controls` use a real TypeSafe credential to send synthetic requests. Queue and control checks create and archive test tasks; they do not change the global routing setting.
+Unit/protocol tests cover manual overrides, task-specific routing, effort thresholds, total deadlines, conservative fallback, cancellation, queue edits, context truncation, retry classification, idempotency, plan dependencies, incomplete history, configuration drift, and separate delivery acceptance.
 
-`check:stage` uses a fixed planning entry point to verify the collaboration flow; the execution model still calls live Jev. The test process pre-approves only `route_execution_subtask` and does not change global permissions. A production Codex Desktop session may ask once for permission to use this tool. Handoff guidance is supplied as this turn's `additionalContext` of type `application` and preserves the user's collaboration mode. The model must follow that guidance and call native tools; it is not a hard interception rule for every tool call.
+Live checks use synthetic prompts and real TypeSafe credentials. The timeout option changes only isolated test settings. The staged integration test uses a fixed planner unless `--live` is supplied; execution selection still calls Jev. It checks plan registration, native children, selected configurations, delivery content, and acceptance evidence. Native protocol success is separate from a restarted desktop UI acceptance test. Do not treat the historical 0.1 sample evaluation as proof of 0.2 routing quality or savings.

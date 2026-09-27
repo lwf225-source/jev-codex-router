@@ -4,6 +4,9 @@ import { join } from 'node:path';
 import { getDataDir, loadSettings, validateThreadId, withDataLock } from './settings.mjs';
 
 const REASON_CODES = new Set(['simple_task', 'standard_task', 'complex_reasoning', 'high_impact', 'uncertain', 'plan_required', 'execution_subtask', 'fallback', 'manual', 'explicit', 'disabled', 'unknown']);
+for (const code of ['aborted', 'catalog_unavailable', 'timeout', 'missing_key', 'service_error', 'context_incomplete', 'judgment', 'capability_limited', 'attempt_limit', 'completion_unknown', 'failure_environment', 'failure_permission', 'failure_plan', 'failure_missing_information', 'failure_unknown', 'transient_retry', 'capability_upgrade', 'capability_ceiling']) REASON_CODES.add(code);
+const TASK_KINDS = new Set(['routine', 'code', 'diagnostic', 'writing', 'research', 'architecture', 'review', 'unknown']);
+const NEXT_ACTIONS = new Set(['execute', 'repair_environment', 'needs_context', 'replan', 'stop']);
 const FEEDBACK = new Set(['too_weak', 'overkill']);
 
 function filePath(dataDir) { return join(getDataDir(dataDir), 'routes.json'); }
@@ -20,7 +23,7 @@ export function normalizeRouteRecord(record, { now = Date.now() } = {}) {
   const model = typeof record.model === 'string' && /^gpt-[a-z0-9][a-z0-9.-]{1,80}$/i.test(record.model) ? record.model : null;
   const effort = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(record.effort) ? record.effort : null;
   if (!model || !effort) throw new TypeError('route record requires valid model and effort');
-  const source = ['jev', 'fallback', 'manual', 'explicit', 'disabled'].includes(record.source) ? record.source : 'fallback';
+  const source = ['jev', 'fallback', 'manual', 'explicit', 'disabled', 'policy'].includes(record.source) ? record.source : 'fallback';
   const reasonCode = REASON_CODES.has(record.reasonCode) ? record.reasonCode : source === 'jev' ? 'unknown' : source;
   return {
     id: typeof record.id === 'string' && /^[a-f0-9-]{36}$/i.test(record.id) ? record.id : randomUUID(),
@@ -34,7 +37,12 @@ export function normalizeRouteRecord(record, { now = Date.now() } = {}) {
     fallback: source === 'fallback' || record.fallback === true,
     elapsedMs: Number.isFinite(record.elapsedMs) ? Math.max(0, Math.min(60000, Math.round(record.elapsedMs))) : 0,
     ...(typeof record.escalated === 'boolean' ? { escalated: record.escalated } : {}),
-    ...(FEEDBACK.has(record.feedback) ? { feedback: record.feedback } : {})
+    ...(FEEDBACK.has(record.feedback) ? { feedback: record.feedback } : {}),
+    ...(TASK_KINDS.has(record.taskKind) ? { taskKind: record.taskKind } : {}),
+    ...(NEXT_ACTIONS.has(record.nextAction) ? { nextAction: record.nextAction } : {}),
+    ...(record.policyVersion === '2.0' ? { policyVersion: record.policyVersion } : {}),
+    ...(typeof record.contextComplete === 'boolean' ? { contextComplete: record.contextComplete } : {}),
+    ...(typeof record.capabilityLimited === 'boolean' ? { capabilityLimited: record.capabilityLimited } : {})
   };
 }
 

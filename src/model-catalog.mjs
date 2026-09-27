@@ -1,11 +1,13 @@
+import { resolveNativeCodexBinary } from './native-binary.mjs';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
-const DEFAULT_BINARY = '/Applications/ChatGPT.app/Contents/Resources/codex';
+
 
 /** Queries the same native Codex binary used by the desktop app. No turn runs. */
-export async function listNativeCodexModels({ binary = process.env.CODEX_JEV_REAL_CLI || DEFAULT_BINARY, timeoutMs = 4000 } = {}) {
-  const child = spawn(binary, ['app-server'], { stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, CODEX_CLI_PATH: '' } });
+export async function listNativeCodexModels({ binary = resolveNativeCodexBinary(), timeoutMs = 4000, signal, spawnImpl = spawn } = {}) {
+  if (signal?.aborted) throw new Error('Codex model catalog cancelled');
+  const child = spawnImpl(binary, ['app-server', '-c', 'mcp_servers={}'], { stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, CODEX_CLI_PATH: '' } });
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   let nextId = 1;
   const pending = new Map();
@@ -25,7 +27,15 @@ export async function listNativeCodexModels({ binary = process.env.CODEX_JEV_REA
   });
   let timer;
   const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Codex model catalog timed out')), timeoutMs); });
-  const startFailure = new Promise((_, reject) => child.once('error', () => reject(new Error('Native Codex could not start'))));
+  let onAbort;
+  const startFailure = new Promise((_, reject) => {
+    child.once('error', () => reject(new Error('Native Codex could not start')));
+    child.once('exit', () => reject(new Error('Native Codex exited before model catalog was read')));
+    child.stdin.on('error', () => reject(new Error('Native Codex catalog input closed')));
+    onAbort = () => reject(new Error('Codex model catalog cancelled'));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
   try {
     return await Promise.race([(async () => {
       await rpc('initialize', { clientInfo: { name: 'jev_router_catalog', title: 'Jev Router Catalog', version: '0.1.0' } });
@@ -36,6 +46,8 @@ export async function listNativeCodexModels({ binary = process.env.CODEX_JEV_REA
     })(), deadline, startFailure]);
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+    pending.clear();
     lines.close();
     child.stdin.end();
     child.kill('SIGTERM');

@@ -33,13 +33,15 @@ function routeDecision(item) {
   return null;
 }
 
-export function findHandoffOrder(items, { requireReview = false, parentId } = {}) {
+export function findHandoffOrder(items, { requireReview = false, requirePlan = false, parentId } = {}) {
   const starts = [];
   const seenChildren = new Set(parentId ? [parentId] : []);
   const completions = new Map();
   const routes = [];
+  const plans = [];
   for (const [index, item] of items.entries()) {
     const tool = item.tool || item.name || '';
+    if (item.type === 'mcpToolCall' && /register_execution_plan/.test(tool) && item.status === 'completed' && !item.error && !item.result?.isError) plans.push(index);
     const ids = item.type === 'subAgentActivity' && item.kind === 'started' ? [item.agentThreadId]
       : item.type === 'collabAgentToolCall' && /^spawn_?agent$/i.test(tool)
         && (!item.status || item.status === 'completed') ? item.receiverThreadIds || [] : [];
@@ -63,6 +65,7 @@ export function findHandoffOrder(items, { requireReview = false, parentId } = {}
     }
   }
   assert.ok(routes.length, 'No completed route_execution_subtask MCP call observed');
+  if (requirePlan) assert.ok(plans.some(index => index < routes[0].index), 'Execution plan was not registered before routing');
   const reviews = starts.filter(item => item.index < routes[0].index);
   const review = reviews.find(item => item.childIds.every(id => {
     const completedAt = completions.get(id);
@@ -72,12 +75,16 @@ export function findHandoffOrder(items, { requireReview = false, parentId } = {}
     assert.ok(reviews.length, 'No native review child spawn before Jev route');
     assert.ok(review, 'Native review child did not complete before Jev route');
   }
-  const executions = routes.map((route, i) => {
+  const executions = routes.flatMap((route, i) => {
     const nextRouteIndex = routes[i + 1]?.index ?? Infinity;
     const executor = starts.find(item => item.index > route.index && item.index < nextRouteIndex);
+    if (route.decision?.nextAction && route.decision.nextAction !== 'execute') {
+      assert.ok(!executor, `Executor started despite nextAction=${route.decision.nextAction}`);
+      return [];
+    }
     assert.ok(executor, `No native executor spawn after Jev subtask route ${i + 1}`);
-    return { routeIndex: route.index, executorIndex: executor.index, executorChildIds: executor.childIds,
-      ...(route.decision ? { decision: route.decision } : {}) };
+    return [{ routeIndex: route.index, executorIndex: executor.index, executorChildIds: executor.childIds,
+      ...(route.decision ? { decision: route.decision } : {}) }];
   });
   return { reviewIndex: review?.index ?? null, reviewChildIds: review?.childIds || [],
     reviewCompletionIndex: review ? Math.max(...review.childIds.map(id => completions.get(id))) : null, executions };
