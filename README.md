@@ -1,4 +1,19 @@
-# Jev 路由 Codex 桌面任务与子代理
+# Jev Model Router for Codex
+
+> An experimental TypeSafe Jev-powered router for Codex Desktop. Choose a model and reasoning effort for each new task, send complex work through stronger planning and optional review, then delegate bounded execution to Codex subagents on cost-effective models.
+
+Jev Codex Router connects TypeSafe Jev to the Codex desktop app through a local MCP server and an `app-server` wrapper. Simple requests can go straight to an execution model; complex tasks can use a stronger planner, with review when useful. If Jev times out or fails, the router falls back to Sol / medium.
+
+- **Task-aware routing:** select an available model and reasoning effort for each new turn.
+- **Planning and review:** reserve stronger models for complex, high-impact, or ambiguous work.
+- **Subagent routing:** choose models for bounded execution tasks and escalate after failures.
+- **Codex integration:** use an MCP server, an `app-server` wrapper, and native task history.
+
+**Status:** 114 automated tests pass. The full native desktop planning-to-subagent workflow remains experimental and still needs end-to-end desktop acceptance. This is an independent community project and is not affiliated with OpenAI.
+
+## 中文项目文档
+
+### Jev 路由 Codex 桌面任务与子代理
 
 本项目将 TypeSafe Jev 接入 Codex 桌面任务路由。每轮新任务开始前，包装器调用 Jev 决定直接执行，或进入强模型规划流程。复杂任务的主代理形成计划；按风险可增加强模型复核；计划明确后，主代理调用 MCP 为各执行子任务选模型，再用 Codex 原生 `spawn_agent` 将任务交给子代理。
 
