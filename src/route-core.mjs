@@ -58,6 +58,16 @@ export async function chooseRoute({
         nextAction: "stop",
       },
     );
+  const review = execution && context.stage === "review";
+  const independentReview = review && context.requireIndependentReview === true;
+  const planner = findModel(catalog, context.plannerModel);
+  const alternatives = independentReview
+    ? catalog.filter((entry) => entry.value !== (planner?.value || context.plannerModel))
+    : catalog;
+  const qualifiedReview = independentReview ? alternatives.filter((entry) =>
+    capabilityRank(entry.value, settings.routingPolicy) >= 2 &&
+    entry.efforts.some((effort) => EFFORTS.indexOf(effort) >= EFFORTS.indexOf("high"))) : alternatives;
+  const reviewCatalog = qualifiedReview.length ? qualifiedReview : alternatives;
   const statusOnly = !execution && routingIntent(prompt) === "status";
   const bounded = buildRoutingContext(context, { statusOnly });
   if (String(prompt ?? "").length > 12000 || String(prompt ?? "").includes("[TRUNCATED:")) {
@@ -69,14 +79,21 @@ export async function chooseRoute({
       ? context.previousRoute
       : null;
   const select = (tier, kind, stage) =>
-    selectPolicyModel(catalog, tier, kind, stage, settings.routingPolicy);
+    selectPolicyModel(reviewCatalog.length ? reviewCatalog : catalog,
+      independentReview && tier === "light" ? "balanced" : tier, kind, stage, settings.routingPolicy);
   const finish = (model, desired, source, extra = {}) => {
+    if (independentReview && !["manual", "explicit"].includes(source) && EFFORTS.indexOf(desired) < EFFORTS.indexOf("high")) desired = "high";
     const effort = resolveEffort(model, desired);
+    const reviewLimited = independentReview &&
+      (capabilityRank(model.value, settings.routingPolicy) < Math.max(2, extra.capabilityFloor || 0) ||
+        EFFORTS.indexOf(effort) < EFFORTS.indexOf("high"));
     const limited =
       EFFORTS.indexOf(effort) < EFFORTS.indexOf(desired) ||
       (extra.capabilityFloor &&
         capabilityRank(model.value, settings.routingPolicy) <
           extra.capabilityFloor);
+    const independenceBlocked = independentReview &&
+      (!context.plannerModel || model.value === (planner?.value || context.plannerModel));
     return {
       model: model.value,
       effort,
@@ -84,7 +101,7 @@ export async function chooseRoute({
       confidence: null,
       phase: execution ? "execution" : "direct",
       needsSecondOpinion: false,
-      taskKind: "unknown",
+      taskKind: review ? "review" : "unknown",
       policyVersion: POLICY_VERSION,
       contextComplete: bounded.contextComplete,
       nextAction:
@@ -98,12 +115,17 @@ export async function chooseRoute({
       (!extra.nextAction || extra.nextAction === "execute")
         ? { nextAction: "needs_context", reasonCode: "context_incomplete" }
         : {}),
-      capabilityLimited: Boolean(limited),
+      capabilityLimited: Boolean(limited || reviewLimited),
       ...(limited &&
       extra.nextAction !== "stop" &&
       !["explicit", "manual"].includes(source)
         ? { nextAction: "replan", reasonCode: "capability_limited" }
         : {}),
+      ...(reviewLimited && extra.nextAction !== "stop" ? { nextAction: "replan", reasonCode: "capability_limited" } : {}),
+      ...(independentReview ? { capabilityFloor: Math.max(2, extra.capabilityFloor || 0) } : {}),
+      ...(independenceBlocked && extra.nextAction !== "stop" ? { nextAction: context.plannerModel ? "replan" : "needs_context",
+        reasonCode: context.plannerModel ? "independent_review_unavailable" : "review_planner_missing",
+        capabilityLimited: true } : {}),
       elapsedMs: Math.round(performance.now() - started),
     };
   };
@@ -157,7 +179,7 @@ export async function chooseRoute({
                 ? "aborted"
                 : "service_error";
     const taskKind =
-      prior?.taskKind ||
+      (review ? "review" : null) || prior?.taskKind ||
       (TASK_KINDS.includes(context.taskKind) ? context.taskKind : "unknown");
     const knownStatus = statusOnly && bounded.contextComplete;
     const known = knownStatus ||
@@ -174,14 +196,14 @@ export async function chooseRoute({
       : taskKind === "routine"
         ? "light"
         : "balanced";
-    const priorModel = prior && findModel(catalog, prior.model);
+    const priorModel = !review && prior && findModel(catalog, prior.model);
     const model =
       (priorModel &&
         capabilityRank(priorModel.value, settings.routingPolicy) >=
           (strong ? 3 : 1) &&
         priorModel) ||
-      (tier === "balanced" && findModel(catalog, settings.fallbackModel)) ||
-      select(tier, taskKind, strong ? "planning" : "execution");
+      (!review && tier === "balanced" && findModel(catalog, settings.fallbackModel)) ||
+      select(tier, taskKind, review ? "review" : strong ? "planning" : "execution");
     const needsReview = !execution && strong && (prior?.highRisk === true || prior?.needsSecondOpinion === true);
     const fallbackVerifier = needsReview ? alternateStrong(catalog, model) : null;
     return finish(
@@ -214,7 +236,7 @@ export async function chooseRoute({
       },
     );
   }
-  const taskKind = judgment.taskKind;
+  const taskKind = review ? "review" : judgment.taskKind;
   const highRisk = prior?.highRisk === true || judgment.highConsequence >= 0.65;
   const complex =
     prior?.capabilityFloor >= 3 ||
@@ -234,7 +256,7 @@ export async function chooseRoute({
     !execution && !statusDirect && (judgment.staged || incomplete || uncertainRouting ||
       ["plan_execute", "planning_only"].includes(prior?.phase));
   const stage = execution
-    ? "execution"
+    ? review ? "review" : "execution"
     : staged
       ? "planning"
       : taskKind === "review"
@@ -342,6 +364,7 @@ export async function chooseSubtaskRoute({
                   ? "needs_context"
                   : null;
   const catalog = normalizeCatalog(models, context.inputModalities);
+  const plannerModel = findModel(catalog, context.plannerModel)?.value || context.plannerModel;
   if (decision) {
     const model =
       findModel(catalog, previousModel) ||
@@ -379,7 +402,10 @@ export async function chooseSubtaskRoute({
   }
   if (failed && category === "transient" && previousModel && previousEffort) {
     const model = findModel(catalog, previousModel);
-    if (model && model.efforts.includes(previousEffort))
+    if (model && model.efforts.includes(previousEffort) &&
+        !(context.stage === "review" && context.requireIndependentReview &&
+          (!context.plannerModel || model.value === plannerModel ||
+            capabilityRank(model.value, settings.routingPolicy) < 2 || EFFORTS.indexOf(previousEffort) < EFFORTS.indexOf("high"))))
       return {
         model: model.value,
         effort: previousEffort,
@@ -416,10 +442,12 @@ export async function chooseSubtaskRoute({
     previousModel &&
     previousEffort &&
     !["stop", "needs_context"].includes(route.nextAction) &&
+    !(context.stage === "review" && context.requireIndependentReview && route.nextAction === "replan") &&
     !["manual", "explicit"].includes(route.source)
   ) {
     const upgrade = upgradeAfterFailure(
-      catalog,
+      context.stage === "review" && context.requireIndependentReview
+        ? catalog.filter((entry) => entry.value !== plannerModel) : catalog,
       findModel(catalog, route.model),
       route.effort,
       previousModel,

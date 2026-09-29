@@ -163,6 +163,8 @@ const DECISION_ENUMS = {
     "context_incomplete",
     "judgment",
     "capability_limited",
+    "independent_review_unavailable",
+    "review_planner_missing",
     "attempt_limit",
     "completion_unknown",
     "failure_environment",

@@ -628,3 +628,27 @@ test('unlinked route evidence and mismatched scoped plan proof cannot verify', t
     { ...h, tasks: [...h.tasks, { childThreadId: 'unread', readError: 'unavailable' }] },
   ]) assert.equal((await reconcileExecutionPlan('parent', changed, options)).allVerified, false);
 }));
+
+
+test("a new review or goal uses a fresh stable unit while same-unit changes cannot bypass identity", temporary(async options => {
+  const review = { unitId: "review-plan", task: "Independently review the plan", acceptanceCriteria: "Plan constraints checked" };
+  const execute = { ...unit, unitId: "execute-plan", dependencies: [review.unitId] };
+  await registerExecutionPlan({ threadId: "parent", units: [review, execute] }, options);
+  let calls = 0;
+  const picker = async () => { calls++; return decide(); };
+  const request = { threadId: "parent", ...review, structuredContext: { stage: "review", goal: "Validate plan" } };
+  const first = await routePlannedUnit(request, picker, options);
+  const same = await routePlannedUnit(request, picker, options);
+  assert.equal(same.reused, true);
+  assert.equal(same.routingToken, first.routingToken);
+  assert.equal(calls, 1);
+  assert.equal((await routePlannedUnit({ ...request, structuredContext: { stage: "execution", goal: "Implement plan" } }, picker, options)).reasonCode, "unit_changed");
+  assert.equal((await routePlannedUnit({ threadId: "parent", ...execute }, picker, options)).reasonCode, "dependency_incomplete");
+  assert.equal((await routePlannedUnit({ ...request, retry: true, launchState: "unknown" }, picker, options)).reasonCode, "completion_check_required");
+  await reconcileExecutionPlan("parent", report(first), options);
+  await recordExecutionAcceptance({ threadId: "parent", unitId: review.unitId, routeId: first.routeId, accepted: true, evidence: "Checked exact plan constraints" }, options);
+  const second = await routePlannedUnit({ threadId: "parent", ...execute, structuredContext: { stage: "execution" } }, picker, options);
+  assert.equal(second.nextAction, "execute");
+  assert.notEqual(second.routingToken, first.routingToken);
+  assert.equal(calls, 2);
+}));

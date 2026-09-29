@@ -6,6 +6,7 @@ import { getThreadSettings, updateThreadSettings } from './settings.mjs';
 import { appendRouteRecord } from './audit-log.mjs';
 import { boundPrompt, routingTimeoutMs, routingIntent } from './routing-context.mjs';
 import { createQueuedStore } from './queued-submissions.mjs';
+import { buildRoutePresentation } from './route-presentation.mjs';
 
 const MAX_CONTEXT = 4500;
 const DEFAULT_ROUTE_WAIT_MS = 2000;
@@ -184,11 +185,39 @@ export function createAppServerProxy({
       && (!selected.effort || selected.effort === expected.effort);
   }
 
+  function presentationFor(threadId, result) {
+    const previous = contexts.get(threadId)?.lastApplied;
+    return buildRoutePresentation({ nextAction: 'execute', ...result }, { scope: 'main', event: 'selected',
+      previousModel: previous?.model, previousEffort: previous?.effort });
+  }
+
+  function noticeInstruction(presentation) {
+    return `Routing visibility: at the start of this turn, briefly show this routing status in normal user-visible commentary, in the user's language: ${presentation.text} ` +
+      'This notice must yield to explicit exact-output, JSON-only, no-extra-text, or equivalent user constraints; omit the notice when extra text is forbidden. ' +
+      'For an active-turn supplement or steering message, retain the current configuration and explicitly say it was retained without a new Jev judgment; do not claim a fresh selection or a running-model change. ' +
+      'A later new turn receives a fresh routing decision even when the selected model and effort are the same.';
+  }
+
+  function announceRetained(threadId, params = {}) {
+    if (!activeTurns.has(threadId) || params.toolOutput ||
+      (!textFromInput(params.input) && !inputModalities(params.input).includes("image"))) return;
+    const state = contexts.get(threadId);
+    const selected = pendingRoutedStarts.get(threadId)?.routed.result || state?.activeRoute;
+    if (!selected) return;
+    const presentation = buildRoutePresentation({ ...selected, source: 'policy', nextAction: 'execute' }, { scope: 'main', event: 'retained' });
+    Promise.resolve().then(() => announce({ threadId, ...selected, source: 'policy', presentation,
+      reason: presentation.text })).catch(error => diagnostic('retained route announcement failed', error));
+    Promise.resolve().then(() => record({ threadId, model: selected.model, effort: selected.effort,
+      source: 'policy', reasonCode: 'continuation_retained', routeScope: 'continuation', selectionEvent: 'retained'
+    })).catch(error => diagnostic('retained route record failed', error));
+  }
+
   function withSelection(params, result) {
     const next = { ...params, model: result.model, effort: result.effort };
     // Per-turn application context reaches the model independently of mode presets.
-    // Keep this key empty on direct turns so an earlier handoff cannot stay sticky.
-    next.additionalContext = { ...params.additionalContext, jev_routing: { kind: 'application', value: '' } };
+    // Replace the owned context each turn, dropping stale stage instructions.
+    const notice = noticeInstruction(presentationFor(params.threadId, result));
+    next.additionalContext = { ...params.additionalContext, jev_routing: { kind: 'application', value: notice } };
     if (result.phase === 'plan_execute') {
       const handoffInstructions = [
         'Jev has selected the staged planning and execution workflow for this task.',
@@ -196,17 +225,18 @@ export function createAppServerProxy({
         'First produce a concrete plan with ordered steps, dependencies, and observable acceptance criteria. Keep the root agent responsible for coordination and final verification.',
         'Preserve every explicit user constraint in the plan and handoff. Copy exact identifiers, file names, numeric values, source and target types, units, and requested boundaries into the reviewer and executor tasks. Before accepting a child result, compare those exact values against the original user message; correct any mismatch before claiming completion.',
         result.needsSecondOpinion
-          ? `Before execution, ask one second strong model to review the plan using model=${result.verifierModel || result.model} and reasoning_effort=${result.verifierEffort || 'high'}, fork_turns="none", and a self-contained review task that includes the user's exact constraints. Have the reviewer check the plan against those constraints, then incorporate material corrections before delegation.`
+          ? `Before execution, register a distinct review unit FIRST, together with provisional execution units that depend on its accepted review, using register_execution_plan. Then call route_execution_subtask for that review unit with structuredContext.stage="review", taskKind="review", plannerModel="${result.model}", requireIndependentReview=true, and the user's exact constraints. Use the returned model and effort for an independent native review child with fork_turns="none"; do not use a fixed verifier model or fall back to the planner while claiming independence. If no eligible independent reviewer is available, honor the limited/replan result. Verify and record review acceptance before dependent execution. Incorporate material corrections; explicitly replace the registered plan and use new unit IDs for changed tasks or phases.`
           : 'A second-model plan review is not required for this task.',
         'Mandatory handoff rule: the root agent may plan, review, coordinate, and verify, but MUST NOT directly perform the planned implementation or write its deliverables. Do not use shell, web, or other execution tools to do the child’s work.',
-        `After the plan is clear, call register_execution_plan with threadId=${params.threadId} and execution units containing stable unitId, dependencies and acceptanceCriteria. Registration never starts work. Then call route_execution_subtask for every execution unit with unitId, task, acceptanceCriteria, concise planSummary, dependencies, structuredContext with fields goal, constraints (exact values), phase, dependencies, acceptanceCriteria, recentResult (including failure evidence), and attachmentStatus, and threadId=${params.threadId}.`,
+        `After the plan is clear, ensure its review and execution units are registered using register_execution_plan with threadId=${params.threadId} and execution units containing stable unitId, dependencies and acceptanceCriteria. Registration never starts work. Then call route_execution_subtask for every execution unit with unitId, task, acceptanceCriteria, concise planSummary, dependencies, structuredContext with fields goal, constraints (exact values), stage, dependencies, acceptanceCriteria, lastResult (including failure evidence), and attachmentStatus, and threadId=${params.threadId}.`,
         'Delegate only when nextAction=execute (or an older route omits nextAction); when nextAction is repair_environment, needs_context, replan or stop, follow that action and DO NOT spawn. After an executable route returns, delegate that unit with the native spawn_agent tool, passing the exact model and reasoning_effort returned by Jev. When routingToken is returned, use it as task_name so the child can be linked to this specific route. Set fork_turns="none" and include a self-contained task, constraints and acceptance criteria; full-history forks cannot override models. Use one execution child by default; create multiple children only for independent work units. If either tool is unavailable, report the unavailable capability instead of claiming a handoff.',
+        'Each distinct phase or goal needs a new stable unitId and a fresh route_execution_subtask decision. A native followup to the same running unit retains its existing configuration; describe it as retained, not freshly routed. If a followup introduces a new phase or goal, register and route a new unit before delegation. Classify a failed same-unit retry explicitly instead of disguising it as a new goal.',
         'An idempotent route can return reused=true with the existing routingToken. Never blindly spawn again for a reused decision: query subtask_history first. If the linked native child already started or completed, retain that child. Only when complete, untruncated history proves not_dispatched may you use the current valid token to dispatch once. If dispatch status is uncertain, stop and resolve that uncertainty.',
         'Classify failures before retry: capability, environment/dependency, permission, transient service, invalid plan, missing information or unknown. Retry routing with the same unitId, explicit retry=true, previousModel, previousEffort, failureCategory and concise failureSummary. At most two execution attempts per unit. Only capability failures justify escalation. Repair environment failures, stop blocked permission work, replan invalid plans and request missing context. For unknown launch state or possible external effects, verify native completion before any retry.',
         'Use a source=fallback route if the MCP returns one. A tool error without a valid model/effort pair is not a route: report it rather than inventing a configuration. When escalated=false after a failed attempt, return to planning instead of repeating the same failed route indefinitely.',
         `Before reporting the execution complete, use the read-only subtask_history tool with threadId=${params.threadId} to check linked children and their recorded status. Treat read errors, truncated child evidence, unlinked routing tokens, or configuredMatchesSuggestion=false as unresolved evidence to investigate. Older global-history truncation may be scoped out only when coverage.currentPlan proves the registration boundary with coverage=complete and the authoritative executionPlan has coverage=complete, coverageScope=currentPlan, and allVerified=true. The currentPlan parent-interval proof alone does not prove child completion or acceptance; missing boundaries or truncated child results remain unresolved. Report scoped completion separately from incomplete global history. Current configured models are not per-turn execution telemetry. Verify the actual deliverable and acceptance criteria separately; a completed child or a model match alone does not prove acceptance. Record acceptance through record_execution_acceptance only after checking native completion/configuration and the actual deliverable. Require allVerified before declaring the registered plan fully verified; missing units, duplicate tokens, pending acceptance and unknown status remain unresolved. This is observed execution plus declared acceptance, not hard tool interception. If the history tool is unavailable, report the verification gap honestly.`,
       ].join(' ');
-      next.additionalContext.jev_routing.value = handoffInstructions;
+      next.additionalContext.jev_routing.value = notice + " " + handoffInstructions;
     }
     if (result.nextAction && result.nextAction !== 'execute') {
       next.additionalContext.jev_routing.value = `Routing nextAction=${result.nextAction}. Address that action before implementation or spawning execution children. A model suggestion alone does not authorize execution. ` + next.additionalContext.jev_routing.value;
@@ -340,19 +370,22 @@ export function createAppServerProxy({
   async function reportRoute(threadId, routed, started) {
     const { result, prompt } = routed;
     const state = contexts.get(threadId) || {};
+    const presentation = presentationFor(threadId, result);
     state.lastApplied = { model: result.model, effort: result.effort };
+    state.activeRoute = state.lastApplied;
     // A progress interlude must not erase safety evidence for a later Continue.
     if (routingIntent(prompt) !== 'status') state.previousRoute = { model: result.model, effort: result.effort, phase: result.phase, taskKind: result.taskKind, highRisk: result.highRisk, needsSecondOpinion: result.needsSecondOpinion, capabilityFloor: result.capabilityFloor, complexity: result.complexity, contextComplete: result.contextComplete };
     state.summary = capped([state.summary, `用户：${capped(prompt || '[图片]', 600)}`].filter(Boolean).join('\n'));
     contexts.set(threadId, state);
-    try { await announce({ threadId, model: result.model, effort: result.effort, source: result.source, reason: visibleReason(result.reason) }); }
+    try { await announce({ threadId, model: result.model, effort: result.effort, source: result.source, presentation, reason: visibleReason(result.reason) }); }
     catch (error) { diagnostic('route announcement failed', error); }
     try {
       await record({ threadId, model: result.model, effort: result.effort, source: result.source,
         reasonCode: reasonCodeFor(result), phase: result.phase === 'plan_execute' || result.phase === 'planning_only' ? 'planning' : 'direct',
         elapsedMs: Math.round(performance.now() - started), fallback: result.source === 'fallback',
         taskKind: result.taskKind, policyVersion: result.policyVersion, nextAction: result.nextAction,
-        contextComplete: result.contextComplete, capabilityLimited: result.capabilityLimited });
+        contextComplete: result.contextComplete, capabilityLimited: result.capabilityLimited,
+        routeScope: presentation.scope, selectionEvent: presentation.event });
     } catch (error) { diagnostic('route record failed', error); }
   }
 
@@ -361,7 +394,7 @@ export function createAppServerProxy({
     const threadId = typeof params?.threadId === 'string' ? params.threadId : '';
     if (launch?.cancelled) { releaseStart(launch); return; }
     if (!threadId) { toChild(message); return; }
-    if (activeTurns.has(threadId)) { launch.sent = true; releaseStart(launch); toChild(message); return; }
+    if (activeTurns.has(threadId)) { announceRetained(threadId, params); launch.sent = true; releaseStart(launch); toChild(message); return; }
     if (startingThreads.has(threadId) && startingThreads.get(threadId) !== launch) {
       // An automatic queue check may still be discovering that the queue is
       // empty. Let its launch settle, then re-evaluate whether this is a new
@@ -373,6 +406,7 @@ export function createAppServerProxy({
     const forwardNewTurn = (outgoing, hasRoute = false) => {
       if (launch.cancelled) return;
       launch.sent = true;
+      if (!hasRoute && contexts.has(threadId)) contexts.get(threadId).activeRoute = null;
       activeTurns.set(threadId, 'pending');
       if (Object.hasOwn(message, 'id')) pendingTurnStarts.set(message.id, threadId);
       toChild({ ...outgoing, params: { ...outgoing.params, additionalContext: {
@@ -543,7 +577,10 @@ export function createAppServerProxy({
       }
       let params = { ...runtime, threadId, input: candidate.input, clientUserMessageId: candidate.clientUserMessageId };
       if (routed) params = withSelection(params, routed.result);
-      else params = { ...params, additionalContext: { ...params.additionalContext, jev_routing: { kind: 'application', value: '' } } };
+      else {
+        if (contexts.has(threadId)) contexts.get(threadId).activeRoute = null;
+        params = { ...params, additionalContext: { ...params.additionalContext, jev_routing: { kind: 'application', value: '' } } };
+      }
       // No await between this final guard and the native write.
       requireUncancelled(launch);
       launch.sent = true;
@@ -754,6 +791,7 @@ export function createAppServerProxy({
         }
       }
     }
+    if (message.method === 'turn/steer') announceRetained(message.params?.threadId, message.params);
     if (message.method === 'turn/start') return handleTurn(message, launch);
     if (message.method?.startsWith('thread/queue/')) return handleQueue(message, launch);
     toChild(line);
