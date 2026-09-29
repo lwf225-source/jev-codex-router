@@ -1,11 +1,12 @@
+import { resolveNativeCodexBinary } from './native-binary.mjs';
 import { spawn } from 'node:child_process';
 
-const DEFAULT_BINARY = '/Applications/ChatGPT.app/Contents/Resources/codex';
+
 const ALLOWED_METHODS = new Set(['initialize', 'thread/read', 'thread/items/list']);
 
 /** A short-lived local connection. It cannot start, resume, or mutate a thread. */
 export async function createNativeHistoryReader({
-  binary = process.env.CODEX_JEV_REAL_CLI || DEFAULT_BINARY,
+  binary = resolveNativeCodexBinary(),
   timeoutMs = 4000,
   maxResponseBytes = 8 * 1024 * 1024,
   spawnImpl = spawn,

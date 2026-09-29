@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, stat, writeFile, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { validateRoutingPolicy } from './routing-policy.mjs';
 
 export const DEFAULT_SETTINGS = Object.freeze({
   enabled: false,
@@ -42,10 +43,11 @@ function validateModelEffort(pair, label) {
 }
 
 function parseGlobalPatch(patch) {
-  if (!patch || typeof patch !== 'object' || Array.isArray(patch) || Object.keys(patch).some(key => !['enabled', 'fallback', 'timeoutMs'].includes(key))) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch) || Object.keys(patch).some(key => !['enabled', 'fallback', 'timeoutMs', 'routingPolicy'].includes(key))) {
     throw new TypeError('unknown global settings field');
   }
   const result = {};
+  if ('routingPolicy' in patch) result.routingPolicy = validateRoutingPolicy(patch.routingPolicy);
   if ('enabled' in patch) {
     if (typeof patch.enabled !== 'boolean') throw new TypeError('enabled must be boolean');
     result.enabled = patch.enabled;
@@ -168,7 +170,8 @@ function effective(settings, threadId) {
     fallbackModel: settings.fallback.model,
     fallbackEffort: settings.fallback.effort,
     timeoutMs: settings.timeoutMs,
-    retentionDays: settings.retentionDays
+    retentionDays: settings.retentionDays,
+    ...(settings.routingPolicy ? { routingPolicy: structuredClone(settings.routingPolicy) } : {})
   };
 }
 

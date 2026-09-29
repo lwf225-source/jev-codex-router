@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { resolveNativeCodexBinary } from '../src/native-binary.mjs';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -12,14 +14,20 @@ import { readTypeSafeKey } from '../src/credential.mjs';
 import { updateSettings } from '../src/settings.mjs';
 import { listRecentRoutes } from '../src/audit-log.mjs';
 import { checkMigrationChecklist, findHandoffOrder, preserveSyntheticArtifact } from './staged-acceptance.mjs';
+import { inspectSubtasks } from '../src/subtask-history.mjs';
+import { reconcileExecutionPlan } from '../src/execution-plan.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const fixtureRequiresReview = process.argv.includes('--review');
 const liveInitialRoute = process.argv.includes('--live');
 const evidenceDir = join(root, 'evaluation', `synthetic-complex-${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}`);
-const maxRunMs = liveInitialRoute ? 600000 : 240000;
+const maxRunMs = liveInitialRoute ? 600000 : fixtureRequiresReview ? 360000 : 240000;
 const startedAt = Date.now();
+const testTimeout = Number(process.argv.find(arg => arg.startsWith('--timeout-ms='))?.split('=')[1] || 2000);
+assert.ok(Number.isInteger(testTimeout) && testTimeout >= 100 && testTimeout <= 10000);
 let scratch;
+let workspace;
+let routeDataDir;
 let native;
 let proxy;
 let child;
@@ -31,10 +39,8 @@ let initialDecision;
 let artifactPreservationFailed = false;
 let outcome = 'setup_failure';
 let evidence = { kind: 'synthetic-staged-flow', startedAt: new Date(startedAt).toISOString(), liveInitialRoute, maxRunMs };
-const nativeCodex = '/Applications/ChatGPT.app/Contents/Resources/codex';
-const unrelatedServers = ['codegraph', 'cocos-creator', 'node_repl', 'computer-use', 'unreal-mcp', 'blender', 'kimi-cu', 'typesafe_jev'];
-const scopedConfig = unrelatedServers.flatMap(name => ['-c', `mcp_servers.${name}.enabled=false`]);
-scopedConfig.push('-c', 'mcp_servers.jev-router.tools.route_execution_subtask.approval_mode="approve"');
+const nativeCodex = resolveNativeCodexBinary();
+const scopedConfig = [];
 // Explicitly forward the isolated metadata directory to the MCP process.
 const ingress = new PassThrough();
 const egress = new PassThrough();
@@ -127,16 +133,30 @@ async function ownTurnContexts(threadId) {
 
 try {
   scratch = await mkdtemp(join(root, '.jev-stage-check-'));
+  workspace = join(scratch, 'workspace');
+  routeDataDir = join(scratch, 'router-state');
+  await mkdir(workspace);
   const apiKey = await readTypeSafeKey();
   assert.ok(apiKey, 'TypeSafe credential is unavailable');
-  scopedConfig.push('-c', `mcp_servers.jev-router.env.JEV_ROUTER_DATA_DIR=${JSON.stringify(scratch)}`);
+  const configured = JSON.parse((await promisify(execFile)(nativeCodex, ['mcp', 'list', '--json'], { timeout: 10000 })).stdout);
+  assert.ok(Array.isArray(configured), 'Cannot establish MCP isolation');
+  const disabled = configured.filter(server => server.name !== 'jev-router').map(server => {
+    assert.equal(typeof server.name, 'string');
+    return server.transport?.type === 'streamable_http'
+      ? `${JSON.stringify(server.name)}={url="http://127.0.0.1:1/disabled",enabled=false}`
+      : `${JSON.stringify(server.name)}={command=${JSON.stringify(process.execPath)},args=[],enabled=false}`;
+  });
+  const tools = ['register_execution_plan', 'route_execution_subtask', 'record_execution_acceptance', 'subtask_history']
+    .map(name => `${name}={approval_mode="approve"}`).join(',');
+  const isolatedJev = `"jev-router"={command=${JSON.stringify(process.execPath)},args=${JSON.stringify([join(root, 'bin', 'jev-router-mcp.mjs')])},enabled=true,env={JEV_ROUTER_DATA_DIR=${JSON.stringify(routeDataDir)}},tools={${tools}}}`;
+  scopedConfig.push('-c', `mcp_servers={${[...disabled, isolatedJev].join(',')}}`);
   native = spawn(nativeCodex, [...scopedConfig, 'app-server'], {
     cwd: root,
-    env: { ...process.env, TYPESAFE_API_KEY: apiKey, CODEX_JEV_REAL_CLI: nativeCodex, JEV_ROUTER_DATA_DIR: scratch, JEV_ROUTER_DISABLE_NOTIFICATIONS: '1' },
+    env: { ...process.env, CODEX_CLI_PATH: '', TYPESAFE_API_KEY: apiKey, CODEX_JEV_REAL_CLI: nativeCodex, JEV_ROUTER_DATA_DIR: routeDataDir, JEV_ROUTER_DISABLE_NOTIFICATIONS: '1' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   exitPromise = new Promise(resolveExit => { native.once('exit', (code, signal) => resolveExit({ code, signal })); native.once('error', error => resolveExit({ error: error.message })); });
-  proxy = createAppServerProxy({ child: native, clientInput: ingress, clientOutput: egress, dataDir: scratch,
+  proxy = createAppServerProxy({ child: native, clientInput: ingress, clientOutput: egress, dataDir: routeDataDir,
     credential: async () => apiKey, route: async args => {
       const decision = await (liveInitialRoute ? chooseRoute : fixtureRoute)(args);
       initialDecision ??= decision;
@@ -149,13 +169,21 @@ try {
   lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   child.stderr.on('data', chunk => { stderr = `${stderr}${chunk.toString()}`.slice(-4000); });
   lines.on('line', onLine);
-  await updateSettings({ enabled: true }, { dataDir: scratch });
+  native.on('error', error => {
+    for (const settle of pending.values()) settle({ error: { message: `Native startup failed: ${error.code || 'unknown'}` } });
+    pending.clear();
+  });
+  native.once('exit', code => {
+    for (const settle of pending.values()) settle({ error: { message: `Native process exited (${code})` } });
+    pending.clear();
+  });
+  await updateSettings({ enabled: true, timeoutMs: testTimeout }, { dataDir: routeDataDir });
   await rpc('initialize', { clientInfo: { name: 'jev_staged_flow_check', title: 'Jev Staged Flow Check', version: '0.1.0' }, capabilities: { experimentalApi: true } });
   child.stdin.write(`${JSON.stringify({ method: 'initialized', params: {} })}\n`);
   const catalog = (await rpc('model/list', { limit: 100, includeHidden: false })).data || [];
   assert.ok(catalog.length, 'Codex returned no available models');
   const start = await rpc('thread/start', {
-    cwd: scratch, ephemeral: false, sandbox: 'workspace-write', approvalPolicy: 'never',
+    cwd: workspace, ephemeral: false, sandbox: 'workspace-write', approvalPolicy: 'never',
     model: catalog.find(model => /sol/i.test(model.model || model.id))?.model || catalog[0].model || catalog[0].id,
   });
   const threadId = start?.thread?.id;
@@ -165,18 +193,18 @@ try {
     threadId,
     input: [{ type: 'text', text: liveInitialRoute
       ? '制定生产数据库大表的跨服务金额精度迁移方案，涉及三个服务、双写切换、旧版本兼容、逐项数据校验、失败回滚和多服务兼容。将金额字段从 NUMERIC(18,2) 扩到 NUMERIC(24,6)。在当前隔离测试目录创建 migration-checklist.md，最多30行，列出具体执行步骤、依赖与验收标准。系统和数据是虚构的；不连接服务、不查外部资料，只创建这个文件。'
-      : '为虚构记账产品设计并交付跨三个服务的金额精度迁移验收清单，写入当前目录 migration-checklist.md，最多30行。三个服务分别生成应收、记录分录、汇总报表；金额从 NUMERIC(18,2) 扩到 NUMERIC(24,6)，须覆盖旧版本兼容、数据校验、依赖和回滚。仅使用给出的虚构背景，不查外部资料；只创建这个文件。' }],
+      : '为虚构记账产品设计并交付跨三个服务的金额精度迁移验收清单，写入当前目录 migration-checklist.md，最多30行。三个服务分别生成应收、记录分录、汇总报表；金额从 NUMERIC(18,2) 扩到 NUMERIC(24,6)，须覆盖旧版本兼容、双写切换、数据校验、依赖和回滚。仅使用给出的虚构背景，不查外部资料；只创建这个文件。' }],
   });
   assert.ok(turn?.turn?.id, 'turn/start returned no turn id');
   activeTurnId = turn.turn.id;
   const finished = await waitTurn(turn.turn.id, Math.max(1000, maxRunMs - (Date.now() - startedAt)));
-  evidence.artifact = await preserveSyntheticArtifact(scratch, evidenceDir);
+  evidence.artifact = await preserveSyntheticArtifact(workspace, evidenceDir);
   evidence = { ...evidence, outcome: 'unaccepted', threadId, parentTurnId: turn.turn.id };
   await mkdir(evidenceDir, { recursive: true });
   await writeFile(join(evidenceDir, 'evidence.json'), `${JSON.stringify(evidence, null, 2)}\n`);
   assert.equal(finished?.status, 'completed', 'staged parent turn did not complete');
 
-  const routes = await listRecentRoutes({ threadId, dataDir: scratch });
+  const routes = await listRecentRoutes({ threadId, dataDir: routeDataDir });
   const planningRoute = routes.find(route => route.phase === 'planning');
   const executionRoutes = routes.filter(route => route.phase === 'execution').reverse();
   const executionRoute = executionRoutes.at(-1);
@@ -202,11 +230,15 @@ try {
   assert.ok(executionRoute, `Jev execution subtask route was not logged: ${JSON.stringify({ decisions, activity })}`);
   assert.equal(executionRoute.source, 'jev', 'Execution route fell back rather than receiving a live Jev judgment');
   assert.notEqual(evidence.artifact.status, 'missing', 'Synthetic task did not create migration-checklist.md');
+  const executionHistory = await inspectSubtasks({ threadId });
+  const executionPlan = await reconcileExecutionPlan(threadId, executionHistory, { dataDir: routeDataDir });
+  evidence.executionPlan = executionPlan;
+  assert.equal(executionPlan.allVerified, true, 'Registered plan has missing, unmatched, incomplete, or unaccepted execution units');
   const checklist = await readFile(join(evidenceDir, 'migration-checklist.md'), 'utf8');
   const contentChecks = checkMigrationChecklist(checklist);
-  const scratchFiles = await readdir(scratch);
-  assert.deepEqual(scratchFiles.filter(name => name !== 'migration-checklist.md' && name !== 'settings.json' && name !== 'routes.json' && !name.endsWith('.lock')), [], 'synthetic task created unexpected files');
-  const handoff = findHandoffOrder(items, { requireReview, parentId: threadId });
+  const scratchFiles = await readdir(workspace);
+  assert.deepEqual(scratchFiles.filter(name => name !== 'migration-checklist.md'), [], 'synthetic task created unexpected files');
+  const handoff = findHandoffOrder(items, { requireReview, requirePlan: true, parentId: threadId });
   const childIds = [...new Set(items.flatMap(item => item.type === 'subAgentActivity' && item.agentThreadId
     ? [item.agentThreadId]
     : item.type === 'collabAgentToolCall' && Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : []))];
@@ -234,6 +266,7 @@ try {
   for (const [index, execution] of handoff.executions.entries()) {
     const logged = executionRoutes[index];
     const decision = execution.decision;
+    assert.equal(decision?.nextAction, 'execute', 'A blocked route cannot authorize subagent execution');
     assert.ok(decision?.model && decision?.effort, `Execution route ${index + 1} did not return model and effort`);
     assert.equal(decision.source, 'jev', `Execution route ${index + 1} did not receive a live Jev judgment`);
     assert.equal(logged.source, decision.source, `Execution route ${index + 1} log source mismatch`);
@@ -284,7 +317,7 @@ try {
   await writeFile(join(evidenceDir, 'evidence.json'), `${JSON.stringify(evidence, null, 2)}\n`).catch(() => {});
   process.stderr.write(`${error.message}\n`);
   if (createdThreadId && scratch) {
-    const routes = await listRecentRoutes({ threadId: createdThreadId, dataDir: scratch }).catch(() => []);
+    const routes = await listRecentRoutes({ threadId: createdThreadId, dataDir: routeDataDir }).catch(() => []);
     process.stderr.write(`${JSON.stringify({ routes, observedActivity })}\n`);
   }
   if (stderr) process.stderr.write(`${stderr.slice(-1200)}\n`);
@@ -313,7 +346,7 @@ try {
   lines?.close();
   if (scratch && outcome !== 'passed') {
     try {
-      evidence.artifact = await preserveSyntheticArtifact(scratch, evidenceDir);
+      evidence.artifact = await preserveSyntheticArtifact(workspace, evidenceDir);
       await mkdir(evidenceDir, { recursive: true });
       await writeFile(join(evidenceDir, 'evidence.json'), `${JSON.stringify(evidence, null, 2)}\n`);
     } catch (error) {

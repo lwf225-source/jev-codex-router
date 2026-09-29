@@ -162,7 +162,7 @@ test('a picker change enters persistent manual mode', async (t) => {
   assert.equal(h.upstream.find((m) => m.id === 21).params.model, 'gpt-6-astra');
 });
 
-test('a timed-out Jev call uses the configured available Sol model', async (t) => {
+test('a timed-out unfamiliar task uses quality-first strong planning', async (t) => {
   const records = [];
   const h = harness({
     route: async () => new Promise(() => {}),
@@ -173,11 +173,11 @@ test('a timed-out Jev call uses the configured available Sol model', async (t) =
   await h.ready();
   h.send({ id: 30, method: 'turn/start', params: { threadId: 'thread-3', input: [{ type: 'text', text: 'Investigate a bug.' }], model: 'gpt-6-astra', effort: 'high' } });
   await until(() => h.upstream.some((m) => m.id === 30));
-  assert.equal(h.upstream.find((m) => m.id === 30).params.model, 'gpt-6-sol');
-  assert.equal(h.upstream.find((m) => m.id === 30).params.effort, 'medium');
+  assert.equal(h.upstream.find((m) => m.id === 30).params.model, 'gpt-6-astra');
+  assert.equal(h.upstream.find((m) => m.id === 30).params.effort, 'high');
   await until(() => records.length === 1);
   assert.equal(records[0].source, 'fallback');
-  assert.equal(records[0].reasonCode, 'fallback');
+  assert.equal(records[0].reasonCode, 'timeout');
 });
 
 test('native completion starts the final edited queue input with a routed model', async (t) => {
@@ -281,7 +281,14 @@ test('staged route adds planner, reviewer, and Jev-routed native subagent handof
   assert.match(params.collaborationMode.settings.developer_instructions, /keep this/);
   assert.equal(params.additionalContext.jev_routing.kind, 'application');
   assert.match(params.additionalContext.jev_routing.value, /model=gpt-6-sol and reasoning_effort=high/);
+  assert.match(params.additionalContext.jev_routing.value, /register_execution_plan/);
   assert.match(params.additionalContext.jev_routing.value, /route_execution_subtask/);
+  assert.match(params.additionalContext.jev_routing.value, /nextAction=execute/);
+  assert.match(params.additionalContext.jev_routing.value, /record_execution_acceptance/);
+  assert.match(params.additionalContext.jev_routing.value, /At most two execution attempts/);
+  assert.match(params.additionalContext.jev_routing.value, /reused=true.*Never blindly spawn again/);
+  assert.match(params.additionalContext.jev_routing.value, /complete, untruncated history proves not_dispatched/);
+  assert.match(params.additionalContext.jev_routing.value, /recentResult.*attachmentStatus/);
   assert.match(params.additionalContext.jev_routing.value, /native spawn_agent/);
   assert.match(params.additionalContext.jev_routing.value, /routingToken.*task_name/);
   assert.match(params.additionalContext.jev_routing.value, /subtask_history.*threadId=thread-staged/);
@@ -383,7 +390,9 @@ test('a supplement arriving before turn/started is forwarded without a second ro
 
 test('slow credential is capped by configured total budget and cannot apply late route', async (t) => {
   const records = [];
+  let routeCalls = 0;
   const h = harness({ credential: async () => new Promise(() => {}),
+    route: async () => { routeCalls++; return { model: 'gpt-6-luna', effort: 'low', source: 'jev' }; },
     settings: async () => ({ enabled: true, mode: 'auto', fallbackModel: 'gpt-6-sol', fallbackEffort: 'medium', timeoutMs: 100 }),
     record: async (entry) => records.push(entry) });
   t.after(h.stop); await h.ready();
@@ -391,9 +400,10 @@ test('slow credential is capped by configured total budget and cannot apply late
   h.send({ id: 90, method: 'turn/start', params: { threadId: 'thread-slow', input: [{ type: 'text', text: 'review' }] } });
   await until(() => h.upstream.some((m) => m.id === 90));
   assert.ok(performance.now() - start < 300);
-  assert.equal(h.upstream.find((m) => m.id === 90).params.model, 'gpt-6-sol');
+  assert.equal(h.upstream.find((m) => m.id === 90).params.model, 'gpt-6-astra');
   await until(() => records.length === 1);
   assert.equal(records[0].source, 'fallback');
+  assert.equal(routeCalls, 0);
 });
 
 test('native start failure retains queue and emits no route claim', async (t) => {
@@ -629,7 +639,7 @@ test('slow context read stays within configured budget and does not route after 
   h.send({ id: 120, method: 'turn/start', params: { threadId: 'thread-slow-read', input: [{ type: 'text', text: 'Review code' }] } });
   await until(() => h.upstream.some((m) => m.id === 120));
   assert.ok(performance.now() - start < 300);
-  assert.deepEqual([h.upstream.find(m => m.id === 120).params.model, h.upstream.find(m => m.id === 120).params.effort], ['gpt-6-sol', 'medium']);
+  assert.deepEqual([h.upstream.find(m => m.id === 120).params.model, h.upstream.find(m => m.id === 120).params.effort], ['gpt-6-astra', 'high']);
   await until(() => records.length === 1);
   assert.equal(records[0].source, 'fallback');
   await new Promise((resolve) => setTimeout(resolve, 350));
@@ -744,7 +754,7 @@ test('an ordinary start waits for a queued launch and becomes a native supplemen
   assert.equal(decisions, 1);
 });
 
-test('the full queue routing budget retains and records the configured fallback', async (t) => {
+test('the full queue routing budget retains and records quality-first fallback', async (t) => {
   const records = [];
   const h = harness({ route: async () => new Promise(() => {}), record: async entry => records.push(entry),
     settings: async () => ({ enabled: true, mode: 'auto', fallbackModel: 'gpt-6-sol', fallbackEffort: 'medium', timeoutMs: 2000 }) });
@@ -753,7 +763,7 @@ test('the full queue routing budget retains and records the configured fallback'
   h.send({ id: 216, method: 'thread/queue/add', params: { threadId: 'queue-timeout', input: [{ type: 'text', text: 'review', text_elements: [] }], clientUserMessageId: 'queue-timeout-id' } });
   await until(() => records.length === 1, 2600);
   const start = h.upstream.find(m => m.method === 'turn/start');
-  assert.deepEqual([start.params.model, start.params.effort], ['gpt-6-sol', 'medium']);
+  assert.deepEqual([start.params.model, start.params.effort], ['gpt-6-astra', 'high']);
   assert.equal(records[0].source, 'fallback');
 });
 
@@ -877,7 +887,7 @@ test('a one-turn override echo preserves the persistent manual model', async (t)
   const patches = [];
   const h = harness({ settings: async () => current,
     setThreadSettings: async (_id, patch) => { patches.push(patch); current = { ...current, ...patch }; return current; },
-    route: args => chooseRoute({ ...args, signal: AbortSignal.abort() }) });
+    route: args => chooseRoute({ ...args, apiKey: null }) });
   t.after(h.stop); await h.ready();
   h.send({ id: 229, method: 'turn/start', params: { threadId: 'manual-once', input: [{ type: 'text', text: '这轮使用 Luna，推理强度设为 low' }] } });
   await until(() => h.proxy.contexts.get('manual-once')?.lastApplied);
@@ -916,4 +926,109 @@ test('a successful picker change during queue selection replaces a stale decisio
     assert.equal(records[0].source, 'manual');
     assert.equal(decisions, 1);
   });
+});
+
+
+test('configured routing wait can exceed two seconds and includes settings work', async (t) => {
+  let seenTimeout;
+  const h = harness({
+    settings: async () => { await new Promise(resolve => setTimeout(resolve, 80)); return { enabled: true, mode: 'auto', timeoutMs: 2600 }; },
+    route: async ({ settings }) => { seenTimeout = settings.timeoutMs; await new Promise(resolve => setTimeout(resolve, 2050)); return { model: 'gpt-6-luna', effort: 'low', source: 'jev' }; },
+  });
+  t.after(h.stop); await h.ready();
+  h.send({ id: 300, method: 'turn/start', params: { threadId: 'long-budget', input: [{ type: 'text', text: 'Rename the local variable' }] } });
+  await until(() => h.upstream.some(m => m.id === 300), 3200);
+  assert.ok(seenTimeout > 2000 && seenTimeout < 2540);
+  assert.equal(h.upstream.find(m => m.id === 300).params.model, 'gpt-6-luna');
+});
+
+test('prompt bound retains both ends and does not change the actual native input', async (t) => {
+  let routedPrompt;
+  const text = 'START EXACT_CONSTRAINT ' + 'x'.repeat(15000) + ' FINAL_CONSTRAINT keep 127 files';
+  const h = harness({ route: async ({ prompt }) => { routedPrompt = prompt; return { model: 'gpt-6-sol', effort: 'medium', source: 'jev' }; } });
+  t.after(h.stop); await h.ready();
+  h.send({ id: 301, method: 'turn/start', params: { threadId: 'bounded-prompt', input: [{ type: 'text', text }] } });
+  await until(() => h.upstream.some(m => m.id === 301));
+  assert.ok(routedPrompt.length <= 12000);
+  assert.match(routedPrompt, /^START EXACT_CONSTRAINT/);
+  assert.match(routedPrompt, /TRUNCATED/);
+  assert.match(routedPrompt, /FINAL_CONSTRAINT keep 127 files$/);
+  assert.equal(h.upstream.find(m => m.id === 301).params.input[0].text, text);
+});
+
+test('same-thread safety evidence only accompanies explicit continuation', async (t) => {
+  const seen = [];
+  const h = harness({ route: async ({ context }) => { seen.push(context); return { model: 'gpt-6-astra', effort: 'high', phase: 'plan_execute', source: 'jev', highRisk: true, capabilityFloor: 'strong' }; } });
+  t.after(h.stop); await h.ready();
+  h.proxy.contexts.set('evidence', { previousRoute: { model: 'gpt-6-astra', effort: 'high', phase: 'plan_execute', highRisk: true, capabilityFloor: 'strong' } });
+  h.send({ id: 302, method: 'turn/start', params: { threadId: 'evidence', input: [{ type: 'text', text: 'Continue' }] } });
+  await until(() => h.upstream.some(m => m.id === 302));
+  assert.equal(seen[0].continuation, true);
+  assert.equal(seen[0].previousRoute.highRisk, true);
+  h.child.stdout.write(`${JSON.stringify({ method: 'turn/completed', params: { threadId: 'evidence', turn: { id: 'turn-302', status: 'completed' } } })}\n`);
+  h.send({ id: 303, method: 'turn/start', params: { threadId: 'evidence', input: [{ type: 'text', text: 'New goal: write a birthday greeting' }] } });
+  await until(() => h.upstream.some(m => m.id === 303));
+  assert.equal(seen[1].previousRoute, undefined);
+});
+
+test('stop route never starts native work and replan explicitly gates implementation', async (t) => {
+  for (const action of ['stop', 'replan']) await t.test(action, async t => {
+    const h = harness({ route: async () => ({ model: 'gpt-6-astra', effort: 'high', source: 'policy', nextAction: action }) });
+    t.after(h.stop); await h.ready();
+    h.send({ id: 304, method: 'turn/start', params: { threadId: `action-${action}`, input: [{ type: 'text', text: 'Perform the next unit' }] } });
+    if (action === 'stop') {
+      await until(() => h.downstream.some(m => m.id === 304 && m.error));
+      assert.equal(h.upstream.some(m => m.id === 304), false);
+    } else {
+      await until(() => h.upstream.some(m => m.id === 304));
+      assert.match(h.upstream.find(m => m.id === 304).params.additionalContext.jev_routing.value, /nextAction=replan.*before implementation/);
+    }
+  });
+});
+
+
+test('confirmed native starts record bounded policy metadata without task contents', async t => {
+  const records = [];
+  const h = harness({ record: async entry => records.push(entry), route: async () => ({
+    model: 'gpt-6-sol', effort: 'medium', source: 'jev', phase: 'direct', taskKind: 'code',
+    policyVersion: '2.0', nextAction: 'execute', contextComplete: true, capabilityLimited: false,
+    reasonCode: 'judgment', reason: 'PRIVATE_TASK_REASON', constraints: 'PRIVATE_CONSTRAINT',
+  }) });
+  t.after(h.stop); await h.ready();
+  h.send({ id: 305, method: 'turn/start', params: { threadId: 'metadata', input: [{ type: 'text', text: 'PRIVATE_TASK_PROMPT' }] } });
+  await until(() => records.length === 1);
+  for (const [key, value] of Object.entries({ taskKind: 'code', policyVersion: '2.0', nextAction: 'execute', contextComplete: true, capabilityLimited: false })) assert.equal(records[0][key], value);
+  assert.doesNotMatch(JSON.stringify(records), /PRIVATE_/);
+});
+
+
+test('status interlude preserves later continuation evidence and omits staged handoff', async (t) => {
+  const seen = [];
+  const h = harness({ route: async args => {
+    seen.push(args.context);
+    return chooseRoute({ ...args, localOnly: true });
+  } });
+  t.after(h.stop); await h.ready();
+  h.proxy.contexts.set('status-interlude', { summary: 'Historical implementation. '.repeat(300),
+    lastResult: 'Tests passed; deployment and native acceptance are still pending.',
+    constraints: 'No deployment before acceptance.',
+    previousRoute: { model: 'gpt-6-astra', effort: 'high', phase: 'plan_execute', taskKind: 'architecture', highRisk: true, needsSecondOpinion: true, capabilityFloor: 3 } });
+  const text = '还有什么优化没做完？只汇报当前状态，不执行改动。';
+  h.send({ id: 390, method: 'turn/start', params: { threadId: 'status-interlude', input: [{ type: 'text', text }] } });
+  await until(() => h.upstream.some(m => m.id === 390));
+  const status = h.upstream.find(m => m.id === 390).params;
+  assert.equal(status.model, 'gpt-6-sol');
+  assert.equal(status.additionalContext.jev_routing.value, '');
+  assert.equal(status.input[0].text, text);
+  assert.equal(seen[0].previousRoute, undefined);
+  assert.equal(seen[0].constraints, 'No deployment before acceptance.');
+  await until(() => h.proxy.contexts.get('status-interlude')?.lastApplied);
+  assert.equal(h.proxy.contexts.get('status-interlude').previousRoute.highRisk, true);
+  h.child.stdout.write(`${JSON.stringify({ method: 'turn/completed', params: { threadId: 'status-interlude', turn: { id: 'turn-390', status: 'completed' } } })}\n`);
+  h.send({ id: 391, method: 'turn/start', params: { threadId: 'status-interlude', input: [{ type: 'text', text: '继续处理剩下的上线工作' }] } });
+  await until(() => h.upstream.some(m => m.id === 391));
+  assert.equal(seen[1].previousRoute.highRisk, true);
+  assert.equal(seen[1].continuation, true);
+  assert.equal(h.upstream.find(m => m.id === 391).params.model, 'gpt-6-astra');
+  assert.match(h.upstream.find(m => m.id === 391).params.additionalContext.jev_routing.value, /staged planning/);
 });

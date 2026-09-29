@@ -111,3 +111,10 @@ test('artifact preservation retains exact final bytes and labels missing or unac
   assert.throws(() => checkMigrationChecklist(bytes.toString()), /checklist misses/);
   assert.deepEqual(await readFile(join(evidence, 'migration-checklist.md')), bytes);
 });
+
+test('v2 blocked routing decisions never authorize an executor spawn', () => {
+ const blocked=route(); blocked.result.structuredContent.nextAction='repair_environment';
+ assert.equal(findHandoffOrder([blocked]).executions.length,0);
+ assert.throws(()=>findHandoffOrder([blocked,activity('started',firstId)]),/despite nextAction/);
+ assert.throws(()=>findHandoffOrder([route(),activity('started',firstId)],{requirePlan:true}),/plan was not registered/);
+});

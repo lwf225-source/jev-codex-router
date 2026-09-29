@@ -4,10 +4,15 @@ import { chooseRoute, detectExplicitOverride } from './route-core.mjs';
 import { readTypeSafeKey } from './credential.mjs';
 import { getThreadSettings, updateThreadSettings } from './settings.mjs';
 import { appendRouteRecord } from './audit-log.mjs';
+import { boundPrompt, routingTimeoutMs, routingIntent } from './routing-context.mjs';
 import { createQueuedStore } from './queued-submissions.mjs';
 
-const MAX_CONTEXT = 2500;
-const MAX_ROUTE_WAIT_MS = 2000;
+const MAX_CONTEXT = 4500;
+const DEFAULT_ROUTE_WAIT_MS = 2000;
+const MAX_ROUTE_WAIT_MS = 10000;
+const routeBudget = settings => Math.min(MAX_ROUTE_WAIT_MS, Math.max(100, routingTimeoutMs(settings?.timeoutMs)));
+const headTail = boundPrompt;
+const explicitContinuation = prompt => routingIntent(prompt) === 'continuation';
 const INTERNAL_REQUEST_TIMEOUT_MS = 450;
 
 function parseLine(line) {
@@ -16,8 +21,8 @@ function parseLine(line) {
 
 function textFromInput(input) {
   if (!Array.isArray(input)) return '';
-  return input.filter((part) => part?.type === 'text' && typeof part.text === 'string')
-    .map((part) => part.text).join('\n').slice(0, 12000);
+  return headTail(input.filter((part) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text).join('\n'), 12000);
 }
 
 function inputModalities(input) {
@@ -29,7 +34,7 @@ function inputModalities(input) {
 }
 
 function capped(value, length = MAX_CONTEXT) {
-  return typeof value === 'string' ? value.slice(-length) : '';
+  return headTail(value, length);
 }
 
 function visibleReason(reason) {
@@ -37,6 +42,7 @@ function visibleReason(reason) {
 }
 
 function reasonCodeFor(result) {
+  if (result.reasonCode) return result.reasonCode;
   if (result.source !== 'jev') return result.source;
   if (result.phase === 'plan_execute' || result.phase === 'planning_only') return 'plan_required';
   if (result.reason?.includes('后果较大')) return 'high_impact';
@@ -193,13 +199,17 @@ export function createAppServerProxy({
           ? `Before execution, ask one second strong model to review the plan using model=${result.verifierModel || result.model} and reasoning_effort=${result.verifierEffort || 'high'}, fork_turns="none", and a self-contained review task that includes the user's exact constraints. Have the reviewer check the plan against those constraints, then incorporate material corrections before delegation.`
           : 'A second-model plan review is not required for this task.',
         'Mandatory handoff rule: the root agent may plan, review, coordinate, and verify, but MUST NOT directly perform the planned implementation or write its deliverables. Do not use shell, web, or other execution tools to do the child’s work.',
-        `After the plan is clear, call the jev-router MCP tool route_execution_subtask for every execution unit. Pass task, acceptanceCriteria, concise planSummary, dependencies, and threadId=${params.threadId}.`,
-        'Immediately after Jev returns, delegate that unit with the native spawn_agent tool, passing the exact model and reasoning_effort returned by Jev. When routingToken is returned, use it as task_name so the child can be linked to this specific route. Set fork_turns="none" and include a self-contained task, constraints and acceptance criteria; full-history forks cannot override models. Use one execution child by default; create multiple children only for independent work units. If either tool is unavailable, report the unavailable capability instead of claiming a handoff.',
-        'If an execution child encounters a bounded implementation failure while the plan remains valid, call route_execution_subtask again with previousModel, previousEffort, and a concise failureSummary; use Jev’s escalated model/effort for the retry. If the plan itself is infeasible, stop that unit, use the evidence to revise the plan, then route the revised execution units through Jev again.',
+        `After the plan is clear, call register_execution_plan with threadId=${params.threadId} and execution units containing stable unitId, dependencies and acceptanceCriteria. Registration never starts work. Then call route_execution_subtask for every execution unit with unitId, task, acceptanceCriteria, concise planSummary, dependencies, structuredContext with fields goal, constraints (exact values), phase, dependencies, acceptanceCriteria, recentResult (including failure evidence), and attachmentStatus, and threadId=${params.threadId}.`,
+        'Delegate only when nextAction=execute (or an older route omits nextAction); when nextAction is repair_environment, needs_context, replan or stop, follow that action and DO NOT spawn. After an executable route returns, delegate that unit with the native spawn_agent tool, passing the exact model and reasoning_effort returned by Jev. When routingToken is returned, use it as task_name so the child can be linked to this specific route. Set fork_turns="none" and include a self-contained task, constraints and acceptance criteria; full-history forks cannot override models. Use one execution child by default; create multiple children only for independent work units. If either tool is unavailable, report the unavailable capability instead of claiming a handoff.',
+        'An idempotent route can return reused=true with the existing routingToken. Never blindly spawn again for a reused decision: query subtask_history first. If the linked native child already started or completed, retain that child. Only when complete, untruncated history proves not_dispatched may you use the current valid token to dispatch once. If dispatch status is uncertain, stop and resolve that uncertainty.',
+        'Classify failures before retry: capability, environment/dependency, permission, transient service, invalid plan, missing information or unknown. Retry routing with the same unitId, explicit retry=true, previousModel, previousEffort, failureCategory and concise failureSummary. At most two execution attempts per unit. Only capability failures justify escalation. Repair environment failures, stop blocked permission work, replan invalid plans and request missing context. For unknown launch state or possible external effects, verify native completion before any retry.',
         'Use a source=fallback route if the MCP returns one. A tool error without a valid model/effort pair is not a route: report it rather than inventing a configuration. When escalated=false after a failed attempt, return to planning instead of repeating the same failed route indefinitely.',
-        `Before reporting the execution complete, use the read-only subtask_history tool with threadId=${params.threadId} to check linked children and their recorded status. Treat read errors, truncated history, unlinked routing tokens, or configuredMatchesSuggestion=false as unresolved evidence to investigate. Current configured models are not per-turn execution telemetry. Verify the actual deliverable and acceptance criteria separately; a completed child or a model match alone does not prove acceptance. If the history tool is unavailable, report the verification gap honestly.`,
+        `Before reporting the execution complete, use the read-only subtask_history tool with threadId=${params.threadId} to check linked children and their recorded status. Treat read errors, truncated child evidence, unlinked routing tokens, or configuredMatchesSuggestion=false as unresolved evidence to investigate. Older global-history truncation may be scoped out only when coverage.currentPlan proves the registration boundary with coverage=complete and the authoritative executionPlan has coverage=complete, coverageScope=currentPlan, and allVerified=true. The currentPlan parent-interval proof alone does not prove child completion or acceptance; missing boundaries or truncated child results remain unresolved. Report scoped completion separately from incomplete global history. Current configured models are not per-turn execution telemetry. Verify the actual deliverable and acceptance criteria separately; a completed child or a model match alone does not prove acceptance. Record acceptance through record_execution_acceptance only after checking native completion/configuration and the actual deliverable. Require allVerified before declaring the registered plan fully verified; missing units, duplicate tokens, pending acceptance and unknown status remain unresolved. This is observed execution plus declared acceptance, not hard tool interception. If the history tool is unavailable, report the verification gap honestly.`,
       ].join(' ');
       next.additionalContext.jev_routing.value = handoffInstructions;
+    }
+    if (result.nextAction && result.nextAction !== 'execute') {
+      next.additionalContext.jev_routing.value = `Routing nextAction=${result.nextAction}. Address that action before implementation or spawning execution children. A model suggestion alone does not authorize execution. ` + next.additionalContext.jev_routing.value;
     }
     if (params.collaborationMode?.settings) next.collaborationMode = {
       ...params.collaborationMode,
@@ -212,11 +222,11 @@ export function createAppServerProxy({
     if (Array.isArray(result?.data)) models = result.data.filter((entry) => entry && entry.hidden !== true);
   }
 
-  async function ensureCatalog() {
+  async function ensureCatalog(deadline = Infinity) {
     if (models.length) return models;
     if (!initialized) return [];
     if (!catalogInFlight) {
-      catalogInFlight = sendInternal('model/list', { limit: 100, includeHidden: false })
+      catalogInFlight = sendInternal('model/list', { limit: 100, includeHidden: false }, remaining(deadline, INTERNAL_REQUEST_TIMEOUT_MS))
         .then((result) => { mergeCatalog(result); return models; })
         .finally(() => { catalogInFlight = null; });
     }
@@ -244,6 +254,16 @@ export function createAppServerProxy({
     }
   }
 
+  function contextSnapshot(current, prompt, input) {
+    return {
+      summary: current.summary || '', progress: current.progress || '', lastResult: current.lastResult || '',
+      ...Object.fromEntries(['constraints', 'failureSummary', 'acceptanceCriteria', 'dependencies', 'goal', 'stage', 'contextComplete']
+        .filter(key => current[key] !== undefined).map(key => [key, current[key]])),
+      inputModalities: inputModalities(input), attachmentsReadable: !inputModalities(input).includes('image'),
+      ...(explicitContinuation(prompt) && current.previousRoute ? { previousRoute: current.previousRoute, continuation: true } : {}),
+    };
+  }
+
   async function contextFor(threadId, prompt, input, deadline = Infinity) {
     const existing = contexts.get(threadId) || {};
     if (!existing.summary && initialized) {
@@ -251,32 +271,25 @@ export function createAppServerProxy({
       observeHistory(threadId, history?.thread?.turns);
     }
     const current = contexts.get(threadId) || {};
-    return {
-      summary: current.summary || '',
-      progress: current.progress || '',
-      lastResult: current.lastResult || '',
-      inputModalities: inputModalities(input),
-    };
+    return contextSnapshot(current, prompt, input);
   }
 
   async function routeInput(threadId, input, params, deadline, preparation = {}) {
     const prompt = textFromInput(input);
     if (!prompt && !inputModalities(input).includes('image')) return null;
-    const settings = preparation.settings || await within(threadSettings(threadId), deadline);
+    const settings = preparation.settings || await within(threadSettings(threadId), Math.min(deadline, (preparation.started ?? performance.now()) + routeBudget(contexts.get(threadId)?.routingSettings)));
     if (settings?.enabled !== true) return null;
     preparation.settings = settings;
-    const end = Math.min(deadline, deadline - MAX_ROUTE_WAIT_MS + Math.min(Math.max(Number(settings.timeoutMs) || MAX_ROUTE_WAIT_MS, 1), MAX_ROUTE_WAIT_MS));
-    const catalog = preparation.catalog || await within(ensureCatalog(), end, models);
+    const end = Math.min(deadline, (preparation.started ?? deadline - MAX_ROUTE_WAIT_MS) + routeBudget(settings));
+    const catalog = preparation.catalog || await within(ensureCatalog(end), end, models);
     if (!catalog.length) {
       diagnostic('route skipped: no available model catalog');
       return null;
     }
     preparation.catalog = catalog;
     const state = contexts.get(threadId) || {};
-    let context = {
-      summary: state.summary || '', progress: state.progress || '', lastResult: state.lastResult || '',
-      inputModalities: inputModalities(input),
-    };
+    let context = contextSnapshot(state, prompt, input);
+    if (!preparation.localOnly && remaining(end)) context = await within(contextFor(threadId, prompt, input, end), end, context);
     const selected = observedSelection(params);
     const explicitlyRequested = detectExplicitOverride(prompt, catalog, context);
     const effectiveSettings = {
@@ -286,32 +299,34 @@ export function createAppServerProxy({
         manualEffort: settings.manualEffort || selected.effort,
       } : {}),
     };
-    // Prepare a catalog-checked local decision before any context/credential
-    // wait. An aborted route cannot call Jev, but still honors manual/explicit
-    // choices and the final input modalities if queued content was edited.
+    // Build the fallback from the freshest available context, including resumed
+    // task evidence, while preserving manual choices and edited modalities.
     let fallback;
     try {
-      fallback = await chooseRoute({ prompt, context, models: catalog, settings: effectiveSettings, signal: AbortSignal.abort() });
-      if (fallback.source === 'fallback') fallback = { ...fallback, reason: 'Jev 超时或不可用，使用备用配置' };
+      fallback = await chooseRoute({ prompt, context, models: catalog, settings: effectiveSettings, localOnly: true, fallbackReasonCode: 'timeout' });
+      if (fallback.source === 'fallback') fallback = { ...fallback, reasonCode: 'timeout' };
     } catch (error) {
       diagnostic('route skipped: no valid local fallback', error);
       return null;
     }
-    if (!preparation.localOnly && remaining(end)) context = await within(contextFor(threadId, prompt, input, end), end, context);
     const controller = new AbortController();
     let result = fallback;
     try {
       if (!preparation.localOnly && remaining(end)) {
-        const key = settings.mode === 'manual' || explicitlyRequested ? null : await within(credential(), end);
-        if (remaining(end)) result = await within(route({
-          prompt: prompt || '[The user supplied an image.]', context, models: catalog,
+        const credentialExpired = Symbol('credential deadline');
+        const bypassCredential = settings.mode === 'manual' || explicitlyRequested;
+        const key = bypassCredential ? null : await within(credential(), end, credentialExpired);
+        if (key === credentialExpired) result = fallback;
+        else if (!key && !bypassCredential) result = await chooseRoute({ prompt, context, models: catalog, settings: effectiveSettings, localOnly: true, fallbackReasonCode: 'missing_key' });
+        else if (remaining(end)) result = await within(route({
+          prompt: prompt || '[The user supplied an image; contents are not readable to the router.]', context, models: catalog,
           settings: { ...effectiveSettings, timeoutMs: remaining(end) }, apiKey: key,
           signal: controller.signal,
         }), end, fallback);
       }
     } catch (error) {
       diagnostic('route failed', error);
-      result = fallback;
+      result = { ...fallback, reasonCode: 'service_error' };
     } finally { controller.abort(); }
     if (!result?.model || !result?.effort) result = fallback;
     const collaborationMode = Object.hasOwn(params, 'collaborationMode') ? params.collaborationMode : state.threadRuntimeSettings?.collaborationMode;
@@ -326,6 +341,8 @@ export function createAppServerProxy({
     const { result, prompt } = routed;
     const state = contexts.get(threadId) || {};
     state.lastApplied = { model: result.model, effort: result.effort };
+    // A progress interlude must not erase safety evidence for a later Continue.
+    if (routingIntent(prompt) !== 'status') state.previousRoute = { model: result.model, effort: result.effort, phase: result.phase, taskKind: result.taskKind, highRisk: result.highRisk, needsSecondOpinion: result.needsSecondOpinion, capabilityFloor: result.capabilityFloor, complexity: result.complexity, contextComplete: result.contextComplete };
     state.summary = capped([state.summary, `用户：${capped(prompt || '[图片]', 600)}`].filter(Boolean).join('\n'));
     contexts.set(threadId, state);
     try { await announce({ threadId, model: result.model, effort: result.effort, source: result.source, reason: visibleReason(result.reason) }); }
@@ -333,7 +350,9 @@ export function createAppServerProxy({
     try {
       await record({ threadId, model: result.model, effort: result.effort, source: result.source,
         reasonCode: reasonCodeFor(result), phase: result.phase === 'plan_execute' || result.phase === 'planning_only' ? 'planning' : 'direct',
-        elapsedMs: Math.round(performance.now() - started), fallback: result.source === 'fallback' });
+        elapsedMs: Math.round(performance.now() - started), fallback: result.source === 'fallback',
+        taskKind: result.taskKind, policyVersion: result.policyVersion, nextAction: result.nextAction,
+        contextComplete: result.contextComplete, capabilityLimited: result.capabilityLimited });
     } catch (error) { diagnostic('route record failed', error); }
   }
 
@@ -373,15 +392,19 @@ export function createAppServerProxy({
       contexts.set(threadId, state);
       if (state.lastApplied && changedFromClient && ((selected.model && selected.model !== state.lastApplied.model)
         || (selected.effort && selected.effort !== state.lastApplied.effort))) {
-        const current = await within(threadSettings(threadId), started + MAX_ROUTE_WAIT_MS);
+        const current = await within(threadSettings(threadId), started + routeBudget(state.routingSettings));
         if (current?.enabled) {
           await within(setThreadSettings(threadId, { mode: 'manual', manualModel: selected.model || state.lastApplied.model,
-            manualEffort: selected.effort || state.lastApplied.effort }), started + MAX_ROUTE_WAIT_MS);
+            manualEffort: selected.effort || state.lastApplied.effort }), started + routeBudget(current));
         }
       }
-      const routed = await routeInput(threadId, params.input, params, started + MAX_ROUTE_WAIT_MS);
+      const routed = await routeInput(threadId, params.input, params, started + MAX_ROUTE_WAIT_MS, { started });
       if (launch.cancelled) return;
       if (!routed) { forwardNewTurn(message); return; }
+      if (routed.result.nextAction === 'stop') {
+        toClient({ id: message.id, error: { code: -32000, message: 'Routing requires stop; no native turn was started' } });
+        return;
+      }
       pendingRoutedStarts.set(threadId, { routed, started });
       forwardNewTurn({ ...message, params: withSelection(params, routed.result) }, true);
     } finally {
@@ -457,13 +480,12 @@ export function createAppServerProxy({
       let candidate = submission;
       let routed = null;
       let attemptId;
-      const preparation = {};
+      const preparation = { started };
       const refreshSelection = async () => {
         const before = contexts.get(threadId) || {};
         const known = (before.routingSettingsRevision || 0) !== settingsRevision
           ? before.routingSettings : preparation.settings;
-        const refreshDeadline = Math.min(deadline, deadline - MAX_ROUTE_WAIT_MS
-          + Math.min(Math.max(Number(known?.timeoutMs) || MAX_ROUTE_WAIT_MS, 1), MAX_ROUTE_WAIT_MS));
+        const refreshDeadline = Math.min(deadline, started + routeBudget(known));
         const current = remaining(refreshDeadline) ? await within(threadSettings(threadId), refreshDeadline, known) : known;
         const latest = contexts.get(threadId) || {};
         const revision = latest.routingSettingsRevision || 0;
@@ -494,6 +516,7 @@ export function createAppServerProxy({
         candidate = latest;
         await refreshSelection();
         requireUncancelled(launch);
+        if (routed?.result.nextAction === 'stop') throw new Error('Routing requires stop; queued execution was not started');
         const marked = await queueStore.markStarting(threadId, candidate.id, candidate.input);
         if (marked.marked) {
           attemptId = marked.attemptId;
@@ -513,6 +536,10 @@ export function createAppServerProxy({
       } catch (error) {
         await queueStore.clearStarting(threadId, candidate.id, attemptId);
         throw error;
+      }
+      if (routed?.result.nextAction === 'stop') {
+        await queueStore.clearStarting(threadId, candidate.id, attemptId);
+        throw new Error('Routing requires stop; queued execution was not started');
       }
       let params = { ...runtime, threadId, input: candidate.input, clientUserMessageId: candidate.clientUserMessageId };
       if (routed) params = withSelection(params, routed.result);
