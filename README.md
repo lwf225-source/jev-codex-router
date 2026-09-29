@@ -55,7 +55,7 @@ To pin a model for a thread, call `thread_settings` with all three fields:
 {"threadId":"YOUR_CODEX_THREAD_ID","mode":"manual","manualModel":"gpt-6-sol","manualEffort":"medium"}
 ```
 
-Call `thread_settings` with `{"threadId":"YOUR_CODEX_THREAD_ID","mode":"auto"}` to resume automatic selection. Choose a model and effort supported by `available_models`. The router acts on a new turn; steering an active turn is passed through unchanged. Plan-only mode stays plan-only.
+Call `thread_settings` with `{"threadId":"YOUR_CODEX_THREAD_ID","mode":"auto"}` to resume automatic selection. Choose a model and effort supported by `available_models`. The router selects for each new turn, even when the resulting configuration is unchanged. It adds a concise visible-status instruction for direct, staged, and plan-only turns, subject to explicit exact-output constraints. Steering an active turn passes through unchanged and is described as retaining the current configuration without a fresh Jev judgment. Desktop notices are best effort; visible commentary and native execution still require observation. Plan-only mode stays plan-only. See [routing boundaries and independent review](docs/routing.md) for registered review and execution units.
 
 See [Routing and handoff](docs/routing.md) for policy, fallback, retries, and execution-plan verification. See [Development and checks](docs/development.md) for test commands and their limits.
 

@@ -1,10 +1,12 @@
 import { readFile, rename, writeFile } from 'node:fs/promises';
+import { ROUTE_EVENTS, ROUTE_SCOPES, ROUTE_REASON_TEXT } from './route-presentation.mjs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { getDataDir, loadSettings, validateThreadId, withDataLock } from './settings.mjs';
 
 const REASON_CODES = new Set(['simple_task', 'standard_task', 'complex_reasoning', 'high_impact', 'uncertain', 'plan_required', 'execution_subtask', 'fallback', 'manual', 'explicit', 'disabled', 'unknown']);
 for (const code of ['aborted', 'catalog_unavailable', 'timeout', 'missing_key', 'service_error', 'context_incomplete', 'judgment', 'capability_limited', 'attempt_limit', 'completion_unknown', 'failure_environment', 'failure_permission', 'failure_plan', 'failure_missing_information', 'failure_unknown', 'transient_retry', 'capability_upgrade', 'capability_ceiling']) REASON_CODES.add(code);
+for (const code of Object.keys(ROUTE_REASON_TEXT)) REASON_CODES.add(code);
 const TASK_KINDS = new Set(['routine', 'code', 'diagnostic', 'writing', 'research', 'architecture', 'review', 'unknown']);
 const NEXT_ACTIONS = new Set(['execute', 'repair_environment', 'needs_context', 'replan', 'stop']);
 const FEEDBACK = new Set(['too_weak', 'overkill']);
@@ -32,6 +34,9 @@ export function normalizeRouteRecord(record, { now = Date.now() } = {}) {
     model,
     effort,
     reasonCode,
+    ...(ROUTE_SCOPES.includes(record.routeScope) ? { routeScope: record.routeScope } : {}),
+    ...(ROUTE_EVENTS.includes(record.selectionEvent) ? { selectionEvent: record.selectionEvent } : {}),
+    ...(typeof record.sameConfiguration === 'boolean' ? { sameConfiguration: record.sameConfiguration } : {}),
     ...(['direct', 'planning', 'execution', 'review'].includes(record.phase) ? { phase: record.phase } : {}),
     source,
     fallback: source === 'fallback' || record.fallback === true,

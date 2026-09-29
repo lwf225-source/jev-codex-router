@@ -1129,3 +1129,74 @@ test("a status query with only truncated historical evidence stays conservative"
   assert.equal(result.phase, "plan_execute");
   assert.equal(result.model, "gpt-6-astra");
 });
+
+
+test("review units use review policy and never recurse into planning", async () => {
+  const result = await chooseSubtaskRoute({ task: "Review the plan", models, apiKey: "test",
+    context: { stage: "review", taskKind: "review", contextComplete: true },
+    settings: { routingPolicy: { stages: { review: ["sol", "astra"] } } },
+    fetchImpl: jev({ score: 1.2, staged: true, secondOpinion: true, taskKind: "code" }) });
+  assert.equal(result.model, "gpt-6-sol");
+  assert.equal(result.taskKind, "review");
+  assert.equal(result.phase, "execution");
+  assert.equal(result.needsSecondOpinion, false);
+});
+
+test("independent review enforces a different eligible model and quality floor", async () => {
+  const args = { task: "Review the plan", models, apiKey: "test", context: {
+    stage: "review", taskKind: "review", plannerModel: "gpt-6-astra", requireIndependentReview: true, contextComplete: true } };
+  const result = await chooseSubtaskRoute({ ...args, fetchImpl: jev({ score: 0.1 }) });
+  assert.equal(result.model, "gpt-6-sol");
+  assert.equal(result.effort, "high");
+  assert.equal(result.capabilityFloor, 2);
+  assert.equal(result.nextAction, "execute");
+  const complex = await chooseSubtaskRoute({ ...args, fetchImpl: jev({ score: 2.5 }) });
+  assert.equal(complex.capabilityLimited, true);
+  assert.equal(complex.nextAction, "replan");
+  const noAlternative = await chooseSubtaskRoute({ ...args, models: [models[0]], fetchImpl: jev() });
+  assert.equal(noAlternative.reasonCode, "independent_review_unavailable");
+  assert.equal(noAlternative.nextAction, "replan");
+  const missingPlanner = await chooseSubtaskRoute({ ...args, context: { ...args.context, plannerModel: undefined }, fetchImpl: jev() });
+  assert.equal(missingPlanner.reasonCode, "review_planner_missing");
+  assert.equal(missingPlanner.nextAction, "needs_context");
+});
+
+test("review manual and explicit choices remain visible but cannot fake independence", async () => {
+  const args = { task: "Review the plan", models, context: { stage: "review", plannerModel: "gpt-6-astra", requireIndependentReview: true },
+    settings: { manualModel: "gpt-6-astra", manualEffort: "high" } };
+  const manual = await chooseSubtaskRoute(args);
+  assert.equal(manual.model, "gpt-6-astra");
+  assert.equal(manual.source, "manual");
+  assert.equal(manual.nextAction, "replan");
+  const explicit = await chooseSubtaskRoute({ ...args, task: "Use Sol with high effort to review the plan" });
+  assert.equal(explicit.model, "gpt-6-sol");
+  assert.equal(explicit.source, "explicit");
+  assert.equal(explicit.nextAction, "execute");
+  const lowManual = await chooseSubtaskRoute({ ...args, settings: { manualModel: "gpt-6-luna", manualEffort: "low" } });
+  assert.equal(lowManual.model, "gpt-6-luna");
+  assert.equal(lowManual.nextAction, "replan");
+});
+
+test("independent review respects catalog modality and supported effort limits", async () => {
+  const result = await chooseSubtaskRoute({ task: "Review an image", models: models.map(m => ({ ...m,
+    inputModalities: m.model === "gpt-6-sol" ? ["text"] : ["text", "image"] })), apiKey: "test",
+    context: { stage: "review", plannerModel: "gpt-6-astra", requireIndependentReview: true,
+      inputModalities: ["text", "image"], attachmentsReadable: true }, fetchImpl: jev() });
+  assert.equal(result.nextAction, "replan");
+  assert.equal(result.capabilityLimited, true);
+  assert.notEqual(result.model, "gpt-6-sol");
+});
+
+
+test("independent review preserves cancellation and selects a capable supported-effort alternative", async () => {
+  const args = { task: "Review the plan", models, apiKey: "test", context: { stage: "review", plannerModel: "gpt-6-astra", requireIndependentReview: true } };
+  const controller = new AbortController(); controller.abort();
+  const stopped = await chooseRoute({ prompt: args.task, models: [models[0]], context: args.context, execution: true, signal: controller.signal });
+  assert.equal(stopped.nextAction, "stop");
+  assert.equal(stopped.reasonCode, "aborted");
+  const selected = await chooseSubtaskRoute({ ...args,
+    models: [models[0], { ...models[1], supportedReasoningEfforts: ["low"] },
+      { id: "gpt-6-terra", model: "gpt-6-terra", supportedReasoningEfforts: ["high"] }], fetchImpl: jev() });
+  assert.equal(selected.model, "gpt-6-terra");
+  assert.equal(selected.nextAction, "execute");
+});

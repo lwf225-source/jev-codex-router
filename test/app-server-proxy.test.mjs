@@ -128,10 +128,12 @@ test('routes each new user turn, keeps context, and passes steering through unch
   await until(() => h.downstream.some((m) => m.method === 'turn/completed'));
   h.send({ id: 12, method: 'turn/start', params: { threadId: 'thread-1', input: [{ type: 'text', text: 'Continue.' }], model: 'gpt-6-sol', effort: 'medium' } });
   await until(() => h.upstream.some((m) => m.id === 12));
-  await until(() => records.length === 2);
+  await until(() => records.length === 3);
   assert.equal(contexts.length, 2);
   assert.match(contexts[1].summary, /Rename a variable/);
-  assert.equal(records.length, 2);
+  assert.equal(records.length, 3);
+  assert.equal(records[1].selectionEvent, 'retained');
+  assert.equal(records[1].source, 'policy');
   assert.equal(pickerPatches.length, 0);
   assert.equal(records[0].reasonCode, 'simple_task');
   assert.ok(!('prompt' in records[0]));
@@ -280,7 +282,8 @@ test('staged route adds planner, reviewer, and Jev-routed native subagent handof
   assert.deepEqual([params.model, params.effort, params.collaborationMode.mode], ['gpt-6-astra', 'xhigh', 'default']);
   assert.match(params.collaborationMode.settings.developer_instructions, /keep this/);
   assert.equal(params.additionalContext.jev_routing.kind, 'application');
-  assert.match(params.additionalContext.jev_routing.value, /model=gpt-6-sol and reasoning_effort=high/);
+  assert.match(params.additionalContext.jev_routing.value, /register a distinct review unit FIRST/);
+  assert.match(params.additionalContext.jev_routing.value, /structuredContext.stage="review".*plannerModel="gpt-6-astra".*requireIndependentReview=true/);
   assert.match(params.additionalContext.jev_routing.value, /register_execution_plan/);
   assert.match(params.additionalContext.jev_routing.value, /route_execution_subtask/);
   assert.match(params.additionalContext.jev_routing.value, /nextAction=execute/);
@@ -288,7 +291,7 @@ test('staged route adds planner, reviewer, and Jev-routed native subagent handof
   assert.match(params.additionalContext.jev_routing.value, /At most two execution attempts/);
   assert.match(params.additionalContext.jev_routing.value, /reused=true.*Never blindly spawn again/);
   assert.match(params.additionalContext.jev_routing.value, /complete, untruncated history proves not_dispatched/);
-  assert.match(params.additionalContext.jev_routing.value, /recentResult.*attachmentStatus/);
+  assert.match(params.additionalContext.jev_routing.value, /lastResult.*attachmentStatus/);
   assert.match(params.additionalContext.jev_routing.value, /native spawn_agent/);
   assert.match(params.additionalContext.jev_routing.value, /routingToken.*task_name/);
   assert.match(params.additionalContext.jev_routing.value, /subtask_history.*threadId=thread-staged/);
@@ -1018,7 +1021,8 @@ test('status interlude preserves later continuation evidence and omits staged ha
   await until(() => h.upstream.some(m => m.id === 390));
   const status = h.upstream.find(m => m.id === 390).params;
   assert.equal(status.model, 'gpt-6-sol');
-  assert.equal(status.additionalContext.jev_routing.value, '');
+  assert.match(status.additionalContext.jev_routing.value, /Routing visibility/);
+  assert.doesNotMatch(status.additionalContext.jev_routing.value, /Mandatory handoff rule/);
   assert.equal(status.input[0].text, text);
   assert.equal(seen[0].previousRoute, undefined);
   assert.equal(seen[0].constraints, 'No deployment before acceptance.');
@@ -1031,4 +1035,81 @@ test('status interlude preserves later continuation evidence and omits staged ha
   assert.equal(seen[1].continuation, true);
   assert.equal(h.upstream.find(m => m.id === 391).params.model, 'gpt-6-astra');
   assert.match(h.upstream.find(m => m.id === 391).params.additionalContext.jev_routing.value, /staged planning/);
+});
+
+
+test('every routed turn replaces stage instructions with a fresh visible notice even for same configuration', async (t) => {
+  let calls = 0;
+  const notices = [];
+  const h = harness({ route: async () => ({ model: 'gpt-6-sol', effort: 'high', source: 'jev', nextAction: 'execute',
+    phase: ++calls === 1 ? 'plan_execute' : 'direct' }), announce: entry => notices.push(entry) });
+  t.after(h.stop); await h.ready();
+  h.send({ id: 500, method: 'turn/start', params: { threadId: 'notice', input: [{ type: 'text', text: 'Implement the plan' }] } });
+  await until(() => notices.length === 1);
+  const old = h.upstream.find(m => m.id === 500).params.additionalContext;
+  assert.match(old.jev_routing.value, /Routing visibility.*staged planning/);
+  h.child.stdout.write(`${JSON.stringify({ method: 'turn/completed', params: { threadId: 'notice', turn: { status: 'completed' } } })}\n`);
+  await until(() => h.downstream.some(m => m.method === 'turn/completed'));
+  h.send({ id: 501, method: 'turn/start', params: { threadId: 'notice', additionalContext: old,
+    input: [{ type: 'text', text: 'Return exactly OK, no extra text.' }] } });
+  await until(() => notices.length === 2);
+  const next = h.upstream.find(m => m.id === 501).params.additionalContext.jev_routing.value;
+  assert.match(next, /Routing visibility/);
+  assert.match(next, /omit the notice when extra text is forbidden/);
+  assert.doesNotMatch(next, /Mandatory handoff rule/);
+  assert.equal(calls, 2);
+  assert.equal(notices[1].presentation.event, 'reselected');
+  assert.equal(notices[1].presentation.sameConfiguration, true);
+});
+
+test('plan-only route carries visible status without execution handoff', async (t) => {
+  const h = harness({ route: async () => ({ model: 'gpt-6-astra', effort: 'high', source: 'jev', phase: 'plan_execute', nextAction: 'execute' }) });
+  t.after(h.stop); await h.ready();
+  h.send({ id: 510, method: 'turn/start', params: { threadId: 'plan-notice', input: [{ type: 'text', text: 'Plan changes' }],
+    collaborationMode: { mode: 'plan', settings: { model: 'gpt-6-sol', reasoning_effort: 'medium' } } } });
+  await until(() => h.upstream.some(m => m.id === 510));
+  const context = h.upstream.find(m => m.id === 510).params.additionalContext.jev_routing.value;
+  assert.match(context, /Routing visibility/);
+  assert.doesNotMatch(context, /Mandatory handoff rule/);
+});
+
+test('active steering reports retained configuration and preserves native protocol unchanged', async (t) => {
+  let calls = 0; const notices = [];
+  const h = harness({ route: async () => { calls++; return { model: 'gpt-6-sol', effort: 'high', source: 'jev', nextAction: 'execute' }; },
+    announce: entry => notices.push(entry) });
+  t.after(h.stop); await h.ready();
+  h.send({ id: 520, method: 'turn/start', params: { threadId: 'retained', input: [{ type: 'text', text: 'Implement' }] } });
+  await until(() => notices.length === 1);
+  const steering = { id: 521, method: 'turn/steer', params: { threadId: 'retained', expectedTurnId: 'turn-520', input: [{ type: 'text', text: 'Preserve the interface' }] } };
+  h.send(steering);
+  await until(() => notices.length === 2);
+  assert.deepEqual(h.upstream.find(m => m.id === 521), steering);
+  assert.equal(calls, 1);
+  assert.equal(notices[1].presentation.event, 'retained');
+  assert.match(notices[1].presentation.text, /未重新/);
+});
+
+
+test('retained notices skip tool receipts and inactive steering and record metadata only', async (t) => {
+  const notices = []; const records = [];
+  const h = harness({ announce: entry => notices.push(entry), record: entry => records.push(entry) });
+  t.after(h.stop); await h.ready();
+  h.send({ id: 530, method: 'turn/start', params: { threadId: 'retained-boundary', input: [{ type: 'text', text: 'Implement' }] } });
+  await until(() => records.length === 1);
+  h.send({ id: 531, method: 'turn/start', params: { threadId: 'retained-boundary', toolOutput: { content: 'tool receipt' }, input: [] } });
+  h.send({ id: 532, method: 'turn/steer', params: { threadId: 'retained-boundary', input: [] } });
+  await until(() => h.upstream.some(m => m.id === 532));
+  assert.equal(notices.length, 1);
+  h.send({ id: 533, method: 'turn/steer', params: { threadId: 'retained-boundary', input: [{ type: 'text', text: 'PRIVATE STEERING TEXT' }] } });
+  await until(() => records.length === 2);
+  assert.equal(records[1].reasonCode, 'continuation_retained');
+  assert.equal(records[1].routeScope, 'continuation');
+  assert.equal(records[1].source, 'policy');
+  assert.doesNotMatch(JSON.stringify(records[1]), /PRIVATE STEERING TEXT/);
+  h.child.stdout.write(`${JSON.stringify({ method: 'turn/completed', params: { threadId: 'retained-boundary', turn: { status: 'completed' } } })}\n`);
+  await until(() => h.downstream.some(m => m.method === 'turn/completed'));
+  h.send({ id: 534, method: 'turn/steer', params: { threadId: 'retained-boundary', input: [{ type: 'text', text: 'Late steering' }] } });
+  await until(() => h.upstream.some(m => m.id === 534));
+  assert.equal(notices.length, 2);
+  assert.equal(records.length, 2);
 });

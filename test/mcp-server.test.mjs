@@ -205,6 +205,7 @@ test("subtask_history reads explicit parent history without credentials or model
     let received;
     const server = createMcpServer({
       dataDir,
+      announce: async () => false,
       readKey: async () => {
         throw new Error("history must not read a credential");
       },
@@ -263,6 +264,7 @@ test("route_execution_subtask passes bounded plan inputs to Jev and does not per
     ];
     const server = createMcpServer({
       dataDir,
+      announce: async () => false,
       readKey: async () => "test-key",
       listModels: async () => liveCatalog,
       recordRoute: async (record, options) => {
@@ -385,6 +387,7 @@ test("route_preview forwards bounded catalog and effective task settings without
     ];
     const server = createMcpServer({
       dataDir,
+      announce: async () => false,
       listModels: async () => liveCatalog,
       chooseRoute: async (options) => {
         received = options;
@@ -491,6 +494,7 @@ test("routing tools bound hung credential reads and do not dispatch late decisio
     ];
     const server = createMcpServer({
       dataDir,
+      announce: async () => false,
       readKey: () => new Promise(() => {}),
       listModels: async () => catalog,
       chooseSubtaskRoute: async () => {
@@ -530,6 +534,7 @@ test("preview preserves structured context and cancels hung catalog discovery", 
     let discovery;
     const server = createMcpServer({
       dataDir,
+      announce: async () => false,
       readKey: async () => null,
       listModels: (options) => {
         discovery = options;
@@ -584,6 +589,7 @@ test("planned route total deadline prevents a late execution attempt", async () 
     });
     const server = createMcpServer({
       dataDir,
+      announce: async () => false,
       readKey: async () => null,
       chooseSubtaskRoute: async () => {
         await gate;

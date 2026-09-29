@@ -17,6 +17,8 @@ import { readTypeSafeKey } from "./credential.mjs";
 import { listNativeCodexModels } from "./model-catalog.mjs";
 import { createQueuedStore } from "./queued-submissions.mjs";
 import { inspectSubtasks } from "./subtask-history.mjs";
+import { buildRoutePresentation, ROUTE_OBSERVABILITY_VERSION, ROUTE_REASON_TEXT } from "./route-presentation.mjs";
+import { announceRoute, scheduleRouteNotice } from "./desktop-notice.mjs";
 import {
   registerExecutionPlan,
   readExecutionPlan,
@@ -40,6 +42,8 @@ const model = z.string().regex(/^gpt-[a-z0-9][a-z0-9.-]{1,80}$/i);
 const threadId = z.string().min(1).max(256);
 const contextSchema = z.object({
   goal: z.string().max(2000).optional(),
+  plannerModel: model.optional(),
+  requireIndependentReview: z.boolean().optional(),
   constraints: z.array(z.string().max(1000)).max(20).optional(),
   phase: z.string().max(100).optional(),
   stage: z.string().max(100).optional(),
@@ -119,20 +123,7 @@ const safely = (fn) => async (args) => {
     return failure(error);
   }
 };
-const reasonText = Object.freeze({
-  simple_task: "任务范围很小，选择轻量配置",
-  standard_task: "常规多步任务，选择均衡配置",
-  complex_reasoning: "需要深入推理，选择更强配置",
-  high_impact: "错误后果较大，选择更强配置",
-  uncertain: "判断信息不足，选择更稳妥的配置",
-  plan_required: "任务进入强模型规划与子代理执行流程",
-  execution_subtask: "Jev 按计划子任务选择模型与推理强度",
-  fallback: "Jev 不可用或超时，使用备用配置",
-  manual: "使用持续手动选择的配置",
-  explicit: "按本次明确指定的配置执行",
-  disabled: "本任务未启用自动路由",
-  unknown: "按当前路由策略选择",
-});
+const reasonText = ROUTE_REASON_TEXT;
 const describeRoute = (route) =>
   route
     ? { ...route, reason: reasonText[route.reasonCode] || reasonText.unknown }
@@ -146,6 +137,7 @@ export function createMcpServer({
   readKey = readTypeSafeKey,
   listModels = listNativeCodexModels,
   inspectHistory = inspectSubtasks,
+  announce = announceRoute,
 } = {}) {
   const server = new McpServer({ name: "jev-codex-router", version: "0.2.0" });
   const queuedStore = createQueuedStore({ dataDir });
@@ -171,6 +163,7 @@ export function createMcpServer({
         : undefined;
       return {
         routerVersion: "0.2.0",
+        routeObservabilityVersion: ROUTE_OBSERVABILITY_VERSION,
         historyVerificationVersion: "current-plan-boundary-v1",
         contextCalibrationVersion: "status-scope-v1",
         policyVersion: "2.0",
@@ -543,7 +536,7 @@ export function createMcpServer({
     "route_execution_subtask",
     {
       description:
-        "After a complex task has a clear plan, ask Jev which native Codex model and reasoning effort should execute one concrete subtask. Pass the task, acceptance criteria, and only the bounded plan/dependency context needed for that subtask. If retrying after failure, also pass the previous model, effort, and a concise failure summary so Jev can recommend an escalation. Only nextAction=execute permits dispatch; repair_environment, needs_context, replan, or stop must be resolved first. Register a plan and pass unitId for idempotency and verification. Use the returned model and effort when calling native spawn_agent, and its routingToken as task_name to correlate the child in subtask_history. Never include credentials or full conversation history; this tool does not store prompt text.",
+        "After a complex task has a clear plan, ask Jev which native Codex model and reasoning effort should execute one concrete subtask. Pass the task, acceptance criteria, and only the bounded plan/dependency context needed for that subtask. If retrying after failure, also pass the previous model, effort, and a concise failure summary so Jev can recommend an escalation. Only nextAction=execute permits dispatch; repair_environment, needs_context, replan, or stop must be resolved first. Register a plan and pass unitId for idempotency and verification. Before dispatch, display presentation.text to the user unless the user explicitly requires an exact output format; respect that format instead. Notification scheduling is not proof of user visibility. Use the returned model and effort when calling native spawn_agent, and its routingToken as task_name to correlate the child in subtask_history. Never include credentials or full conversation history; this tool does not store prompt text.",
       inputSchema: {
         unitId: z.string().max(128).optional(),
         attempt: z.number().int().min(1).max(2).optional(),
@@ -783,6 +776,16 @@ export function createMcpServer({
           };
         }
       }
+      const presentationOptions = {
+        scope: args.structuredContext?.stage === "review" || args.structuredContext?.phase === "review" ? "review" : "subtask",
+        previousModel,
+        previousEffort,
+      };
+      // Missing configuration never authorizes a dispatch, even from an injected provider.
+      decision.presentation = buildRoutePresentation(decision, presentationOptions);
+      if (decision.presentation.nextAction === "stop" && decision.nextAction === "execute") {
+        decision.nextAction = "stop";
+      }
       if (decision.routeId && !decision.reused) {
         try {
           await recordRoute(
@@ -806,6 +809,9 @@ export function createMcpServer({
               elapsedMs: decision.elapsedMs,
               fallback: decision.source === "fallback",
               escalated: decision.escalated,
+              routeScope: decision.presentation.scope,
+              selectionEvent: decision.presentation.event,
+              sameConfiguration: decision.presentation.sameConfiguration,
             },
             { dataDir },
           );
@@ -818,6 +824,11 @@ export function createMcpServer({
             error?.name ?? "Error",
           );
         }
+      }
+      if (!decision.reused && decision.presentation.model && decision.presentation.effort) {
+        // Delivery runs outside the routing deadline and cannot mutate or retry the decision.
+        void scheduleRouteNotice(decision, { announce, ...presentationOptions });
+        decision.notification = { delivery: "scheduled", userSeen: null };
       }
       return decision;
     }),

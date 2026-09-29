@@ -2,6 +2,12 @@
 
 The router uses one TypeSafe Jev judgment to classify task type, complexity, consequence, missing information, planning, and review needs. Policy code then selects from the current native Codex model catalog and chooses a supported reasoning effort. A decision is advice; verify native execution and the result separately.
 
+## Visible routing and task boundaries
+
+Each newly routed main turn receives a short routing-status instruction in its application context. Direct, staged, and plan-only turns all get the notice; replacing that context removes prior stage instructions. The assistant is instructed to show it in ordinary commentary, and to omit it when an explicit exact-output, JSON-only, or no-extra-text constraint forbids additional text. A best-effort desktop notification can also display the shared presentation. This is an instruction and observed notification delivery, not guaranteed UI rendering or per-turn execution telemetry.
+
+A new turn gets a fresh selection even if it chooses the same configuration. Steering and supplements during an active turn retain the running configuration; their protocol messages pass through unchanged, and a retained notice explicitly says Jev was not queried again. The router does not change the running model or introduce native protocol fields. A same-unit native child followup likewise retains its configuration. A distinct phase or goal needs a new stable unit ID and a fresh `route_execution_subtask` decision. This applies at task boundaries, not to every shell command.
+
 ## Model policy
 
 The `routingPolicy` setting accepts `tiers`, `tasks`, `stages`, and `models`. Tiers are `light`, `balanced`, and `strong`; task kinds are `routine`, `code`, `diagnostic`, `writing`, `research`, `architecture`, `review`, and `unknown`; stages are `planning`, `review`, and `execution`. Preference arrays contain `astra`, `sol`, `terra`, `luna`, or exact native `gpt-...` model IDs. `models` maps exact IDs to declared `capability` values 1, 2, or 3. Preferences are intersected with the available account catalog. Unknown models are not silently treated as cheap alternatives, and a larger version number alone does not establish better capability.
@@ -50,9 +56,15 @@ Current-plan verification can be complete even if older global history is trunca
 
 Retry arguments include `retry`, `attempt`, `failureCategory`, `failureSummary`, `launchState`, and `possibleExternalEffects`. Use the stored previous configuration and authoritative attempt count. A rejected completed deliverable can be retried only after classification and confirmation of the previous execution state.
 
+## Independent plan review
+
+When a plan needs an independent review, first register a review unit and provisional execution units that depend on it. Route the review through `route_execution_subtask` with `structuredContext.stage: "review"`, `taskKind: "review"`, `plannerModel` set to the actual planner ID, and `requireIndependentReview: true`. The selected reviewer uses the current catalog and review policy; it does not recursively start another planning workflow. A legacy main-route verifier suggestion is not authorization to skip this routing step.
+
+Independent review requires a different model ID with at least capability 2 and high effort, and preserves any higher capability floor required by the judgment. Catalog visibility, supported inputs, and supported efforts still apply. A missing planner ID requests context. No suitable independent alternative produces a limitation and `replan`; a manual or explicit selection remains visible but cannot claim independence if it selects the planner or falls below that quality floor. Complete and accept the review before dependent execution. Revisions use explicit plan replacement and new unit IDs for changed work, preserving attempt history for unchanged units.
+
 ## Context, queues, and retention
 
-The current prompt and bounded same-task context go to TypeSafe. Structured context may contain `goal`, `constraints`, `phase`, `dependencies`, `acceptanceCriteria`, `lastResult`, and `attachmentStatus` (`none`, `readable`, `unreadable`, or `unknown`), plus bounded legacy summary and progress fields. The router does not automatically read project files or send attachment bytes. Unread attachments are marked as missing information.
+The current prompt and bounded same-task context go to TypeSafe. Structured context may contain `goal`, `constraints`, `stage`, `taskKind`, `dependencies`, `acceptanceCriteria`, `lastResult`, and `attachmentStatus` (`none`, `readable`, `unreadable`, or `unknown`), plus bounded legacy summary and progress fields. The router does not automatically read project files or send attachment bytes. Unread attachments are marked as missing information.
 
 The prompt view is capped at 12,000 characters with head/tail retention and a truncation marker. Context fields share an approximately 4,500-character text budget, prioritizing explicit constraints and recent failure evidence. A recognized status-only question may use recent results and progress before a historical summary capped at 900 characters. These checks establish evidence availability, not freshness or truth. Execution continuations retain conservative history requirements. The original input still goes to native Codex.
 
